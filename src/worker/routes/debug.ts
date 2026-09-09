@@ -1,6 +1,8 @@
 import type { Handler } from '../router.ts'
 import { createRun } from '../runner/create-run.ts'
 import { prCoordinator } from '../do/pr-coordinator.ts'
+import { getPreview, previewTimeoutMs, startPreview } from '../preview/reconcile.ts'
+import type { PreviewConfig } from '../preview/config.ts'
 
 // Every handler here is registered through devOnly() in index.ts, so none of
 // them exists unless ENABLE_DEBUG_ROUTES is on.
@@ -91,22 +93,25 @@ export const debugStubRun: Handler = async (req, env, ctx) => {
     prNumber?: number
     title?: string
     subset?: string[]
+    headRef?: string
   }
   const body = await req.json<StubRunBody>().catch(() => ({} as StubRunBody))
   const repo = body.repo ?? 'demo/repo'
   const prNumber = body.prNumber ?? 1
   const headSha = `sha-${Math.random().toString(36).slice(2, 10)}`
+  const headRef = body.headRef ?? `pr-${prNumber}`
   const now = Date.now()
 
   await env.DB.prepare(
-    `INSERT INTO prs (repo, pr_number, head_sha, base_ref, state, title, opened_at, updated_at)
-     VALUES (?1, ?2, ?3, 'main', 'open', ?4, ?5, ?5)
+    `INSERT INTO prs (repo, pr_number, head_sha, head_ref, base_ref, state, title, opened_at, updated_at)
+     VALUES (?1, ?2, ?3, ?4, 'main', 'open', ?5, ?6, ?6)
      ON CONFLICT(repo, pr_number) DO UPDATE SET
        head_sha = excluded.head_sha,
+       head_ref = excluded.head_ref,
        title = COALESCE(excluded.title, prs.title),
-       updated_at = ?5`,
+       updated_at = ?6`,
   )
-    .bind(repo, prNumber, headSha, body.title ?? null, now)
+    .bind(repo, prNumber, headSha, headRef, body.title ?? null, now)
     .run()
 
   const { runId } = await createRun(env, ctx, {
@@ -115,9 +120,79 @@ export const debugStubRun: Handler = async (req, env, ctx) => {
     headSha,
     baseSha: null,
     baseRef: 'main',
+    headRef,
     trigger: 'manual',
     subset: body.subset ?? null,
   })
 
   return Response.json({ runId, headSha, prUrl: `/repo/${repo}/pr/${prNumber}` })
+}
+
+// GET /api/debug/preview?repo=owner/name&prNumber=1
+// The PR's preview environment as both halves see it: the D1 row the
+// reconciler writes, and the gate the PR object holds dispatches on.
+export const debugPreview: Handler = async (req, env) => {
+  const url = new URL(req.url)
+  const repo = url.searchParams.get('repo') ?? ''
+  const prNumber = Number(url.searchParams.get('prNumber') ?? NaN)
+  if (!repo || !Number.isFinite(prNumber)) {
+    return Response.json({ error: 'repo and prNumber required' }, { status: 400 })
+  }
+  const resp = await prCoordinator(env, repo, prNumber).fetch('https://do/preview')
+  return Response.json({ row: await getPreview(env, repo, prNumber), gate: await resp.json() })
+}
+
+// POST /api/debug/preview-step
+// Body: { repo, prNumber } — run one reconcile step now instead of waiting
+// for the PR object's alarm, so the e2e can drive a preview to ready.
+export const debugPreviewStep: Handler = async (req, env) => {
+  const { repo, prNumber } = await req.json<{ repo: string; prNumber: number }>()
+  const resp = await prCoordinator(env, repo, prNumber).fetch('https://do/preview-step', {
+    method: 'POST',
+  })
+  return Response.json(await resp.json())
+}
+
+// The preview environment dev and the e2e open by hand. It names a project
+// and a Worker that do not exist, which is why it only ever runs under
+// PREVIEW_PROVIDER=stub.
+const STUB_PREVIEW: PreviewConfig = {
+  supabase: { projectRef: 'stubstubstubstubstub', withData: false },
+  cloudflare: { worker: 'stub-preview-pr-{pr}', secrets: {} },
+  sceneEnv: { SCENETEST_PREVIEW_URL: 'preview_url', SCENETEST_SUPABASE_URL: 'url' },
+}
+
+// POST /api/debug/preview-start
+// Body: { repo, prNumber, headSha?, gitBranch?, config? } — open a preview
+// environment for a PR without a pipeline file declaring one, so the gate can
+// be driven end to end against the stub provider.
+export const debugPreviewStart: Handler = async (req, env) => {
+  const body = await req.json<{
+    repo: string
+    prNumber: number
+    headSha?: string
+    gitBranch?: string
+    config?: PreviewConfig
+  }>()
+  const started = await startPreview(
+    env,
+    {
+      repo: body.repo,
+      prNumber: body.prNumber,
+      headSha: body.headSha ?? 'debug',
+      gitBranch: body.gitBranch ?? `pr-${body.prNumber}`,
+    },
+    body.config ?? STUB_PREVIEW,
+  )
+  if (!started) return Response.json({ error: 'preview not started' }, { status: 400 })
+
+  const resp = await prCoordinator(env, body.repo, body.prNumber).fetch('https://do/preview-start', {
+    method: 'POST',
+    body: JSON.stringify({
+      repo: body.repo,
+      prNumber: body.prNumber,
+      deadline: Date.now() + previewTimeoutMs(env),
+    }),
+  })
+  return Response.json(await resp.json(), { status: 202 })
 }

@@ -2,6 +2,7 @@ import type { Env } from '../env.ts'
 import { ghHeaders } from '../github.ts'
 import { sha256Hex } from '../hash.ts'
 import { imageStageHash } from './image.ts'
+import { parsePreview, type PreviewConfig } from '../preview/config.ts'
 
 // The pipeline file: scenetest/pipeline.json in the user's repo. v0 fields
 // are `watch` and `run`; `save`, `restore`, and `toolchain` are reserved for
@@ -35,6 +36,10 @@ export interface PipelineConfig {
   // pipeline file, so editing it cascades (the file hashes into every
   // stage) and the box always holds the current command.
   scenes: string
+  // Optional hosted preview environment: the scenes run against a deployed
+  // Worker backed by a Supabase preview branch, not against a server the box
+  // started (docs/preview-environments.md).
+  preview: PreviewConfig | null
 }
 
 export interface StagePlan {
@@ -44,6 +49,7 @@ export interface StagePlan {
   // What the box must execute on divergence, in order.
   stages: Array<{ name: string; run?: string }>
   scenes: string
+  preview: PreviewConfig | null
   coarse: boolean
 }
 
@@ -67,6 +73,7 @@ export function defaultPipeline(): PipelineConfig {
       },
     ],
     scenes: DEFAULT_SCENES_COMMAND,
+    preview: null,
   }
 }
 
@@ -80,7 +87,7 @@ export function parsePipeline(raw: string): PipelineConfig | null {
   } catch {
     return null
   }
-  const cfg = data as { version?: unknown; stages?: unknown; scenes?: unknown }
+  const cfg = data as { version?: unknown; stages?: unknown; scenes?: unknown; preview?: unknown }
   if (cfg.version !== 1 || !Array.isArray(cfg.stages) || cfg.stages.length === 0) return null
   if (cfg.scenes !== undefined && typeof cfg.scenes !== 'string') return null
 
@@ -95,7 +102,17 @@ export function parsePipeline(raw: string): PipelineConfig | null {
     if (!Array.isArray(watch) || !watch.every((g) => typeof g === 'string' && g.length > 0)) return null
     stages.push({ name: s.name, watch: watch as string[], ...(s.run !== undefined ? { run: s.run as string } : {}) })
   }
-  return { version: 1, stages, scenes: typeof cfg.scenes === 'string' ? cfg.scenes : DEFAULT_SCENES_COMMAND }
+  // An unparseable preview block drops only the preview: the rest of the file
+  // is still a better plan than the coarse fallback, and the run fails on the
+  // missing environment rather than on a silently coarse rebuild.
+  const preview = cfg.preview === undefined ? null : parsePreview(cfg.preview)
+  if (cfg.preview !== undefined && !preview) console.warn('pipeline: invalid preview block; ignoring it')
+  return {
+    version: 1,
+    stages,
+    scenes: typeof cfg.scenes === 'string' ? cfg.scenes : DEFAULT_SCENES_COMMAND,
+    preview,
+  }
 }
 
 // Minimal glob-to-regex: '**' crosses directories, '*' stays within one path
@@ -168,6 +185,7 @@ function coarsePlan(headSha: string): StagePlan {
     vector: { '*coarse*': headSha },
     stages: fallback.stages.map((s) => ({ name: s.name, run: s.run })),
     scenes: fallback.scenes,
+    preview: null,
     coarse: true,
   }
 }
@@ -212,7 +230,7 @@ export async function computeStagePlan(env: Env, repo: string, headSha: string):
     }
 
     const { vector, stages } = await computeVector(config, tree, await imageStageHash(), pipelineFileSha)
-    return { vector, stages, scenes: config.scenes, coarse: false }
+    return { vector, stages, scenes: config.scenes, preview: config.preview, coarse: false }
   } catch (err) {
     console.warn(`pipeline: coarse fallback for ${repo}@${headSha}: ${err instanceof Error ? err.message : err}`)
     return coarsePlan(headSha)

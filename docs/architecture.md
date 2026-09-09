@@ -328,6 +328,23 @@ configuration. The split rule: anything that affects artifact content lives in t
 repo; anything operational lives in the UI — otherwise the same tree would build
 differently on different days and the content-addressing would rot.
 
+### Hosted preview environments
+
+Not every project can be served from the box. When the app under test is
+itself a deployed Worker over a hosted database, the environment a PR needs is
+a preview Worker pointing at a Supabase preview branch — both built by the
+project's own tooling, both slow. A pipeline file can declare that shape, and
+the PR object then holds the PR's scene batches until the branch is healthy,
+its keys have been written to the Worker, and the scenes have a URL to open.
+Stage updates are not held: the box builds while the environment does.
+
+The environment is per PR, like the box, and owns no infrastructure of its
+own — it is a reconciler over two other services' state, stepped from the PR
+object's alarm and recorded in a D1 row that holds refs and URLs but not the
+keys it passes through. A failure or a timeout fails the PR's runs with the
+reason, rather than letting scenes run against last week's database. Details
+in docs/preview-environments.md.
+
 ### Auth
 
 Three surfaces:

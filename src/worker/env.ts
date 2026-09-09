@@ -48,6 +48,25 @@ export interface Env {
   // reaper destroys anything older regardless of run state, catching boxes the
   // idle alarm never retired (a crashed object, a run that never settled).
   RUNNER_MAX_AGE_MINUTES?: string
+  // Hosted preview environments (docs/preview-environments.md). A PR whose
+  // pipeline file declares a `preview` block waits for a Supabase preview
+  // branch, then writes its keys to the project's Cloudflare preview Worker.
+  // PREVIEW_PROVIDER selects the implementation: unset (the feature is off and
+  // a declared preview fails the run with that reason), 'supabase-cloudflare',
+  // or 'stub' (dev and e2e: ready after one poll, no external calls).
+  PREVIEW_PROVIDER?: string
+  // Give up on a preview that never becomes ready (default 20). The PR's
+  // queued runs then fail with the last thing the reconciler was waiting on.
+  PREVIEW_TIMEOUT_MINUTES?: string
+  // How often the PR object re-checks a building preview (default 20).
+  PREVIEW_POLL_SECONDS?: string
+  // Supabase personal access token (secret), scopes environment:write and
+  // secrets:read — it creates the preview branch and reads its API keys.
+  SUPABASE_ACCESS_TOKEN?: string
+  // Cloudflare API token (secret) with Workers Scripts:Edit, and the account
+  // the preview Workers live in.
+  CLOUDFLARE_API_TOKEN?: string
+  CLOUDFLARE_ACCOUNT_ID?: string
   // Primary teardown: idle window in minutes (default 5). The PR coordinator
   // resets a Durable Object alarm on every activity signal and retires the box
   // when the alarm fires with all the PR's runs settled (PrCoordinator.alarm).

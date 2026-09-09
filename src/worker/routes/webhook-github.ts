@@ -3,6 +3,7 @@ import type { Env } from '../env.ts'
 import { verifyWebhookSignature } from '../github.ts'
 import { createRun } from '../runner/create-run.ts'
 import { retireBox } from '../runner/box.ts'
+import { cleanupPreview } from '../preview/reconcile.ts'
 
 // POST /webhook/github
 //
@@ -22,7 +23,7 @@ interface PullRequestPayload {
   pull_request: {
     state: string
     title?: string
-    head: { sha: string }
+    head: { sha: string; ref?: string }
     base: { ref: string; sha: string }
   }
 }
@@ -161,23 +162,35 @@ async function handleEvent(
       .bind(repo, prNumber)
       .first<{ id: string }>()
     if (box) await retireBox(env, box.id)
+    // The PR's Supabase preview branch is billable and no longer has a PR to
+    // serve. Deleting it is best-effort and off the response path; the row
+    // goes either way, so a later push re-creates the branch from scratch.
+    ctx.waitUntil(
+      cleanupPreview(env, repo, prNumber).catch((err) =>
+        console.error(`preview cleanup(${repo}#${prNumber}) failed: ${err instanceof Error ? err.message : err}`),
+      ),
+    )
     pokeHome(env, ctx, repo, prNumber) // PR left the open set → tile disappears live
     return { ...base, result: box ? 'pr-closed:retired' : 'pr-closed' }
   }
 
   const headSha = payload.pull_request.head.sha
+  // Nullable: a payload without it (a hand-rolled delivery, a fixture) still
+  // opens a PR, it just can't be matched to a Supabase preview branch.
+  const headRef = payload.pull_request.head.ref ?? null
   const baseRef = payload.pull_request.base.ref
   const baseSha = payload.pull_request.base.sha
   const title = payload.pull_request.title ?? null
 
   await env.DB.prepare(
-    `INSERT INTO prs (repo, pr_number, head_sha, base_ref, state, title, opened_at, updated_at)
-     VALUES (?1, ?2, ?3, ?4, 'open', ?5, ?6, ?6)
+    `INSERT INTO prs (repo, pr_number, head_sha, head_ref, base_ref, state, title, opened_at, updated_at)
+     VALUES (?1, ?2, ?3, ?4, ?5, 'open', ?6, ?7, ?7)
      ON CONFLICT(repo, pr_number) DO UPDATE SET
-       head_sha = excluded.head_sha, base_ref = excluded.base_ref,
-       title = excluded.title, state = 'open', updated_at = ?6`,
+       head_sha = excluded.head_sha, head_ref = excluded.head_ref,
+       base_ref = excluded.base_ref,
+       title = excluded.title, state = 'open', updated_at = ?7`,
   )
-    .bind(repo, prNumber, headSha, baseRef, title, now)
+    .bind(repo, prNumber, headSha, headRef, baseRef, title, now)
     .run()
 
   // A queued filter ("on the next push, only re-run these scenes") is
@@ -203,6 +216,7 @@ async function handleEvent(
     headSha,
     baseSha,
     baseRef,
+    ...(headRef ? { headRef } : {}),
     trigger: subset ? 'auto-filter' : 'push',
     subset,
   })

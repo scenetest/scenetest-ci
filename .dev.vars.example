@@ -26,3 +26,11 @@ GITHUB_WEBHOOK_SECRET=
 # Optional. Lifts GitHub API rate limits for pipeline stage-hashing
 # (docs/pipeline.md); without it hashing degrades to coarse rebuilds.
 # GITHUB_API_TOKEN=
+
+# Hosted preview environments (docs/preview-environments.md). Unset, a repo
+# declaring a `preview` block fails its runs with that as the reason; "stub"
+# resolves one locally without calling either service.
+# PREVIEW_PROVIDER=stub
+# SUPABASE_ACCESS_TOKEN=
+# CLOUDFLARE_API_TOKEN=
+# CLOUDFLARE_ACCOUNT_ID=

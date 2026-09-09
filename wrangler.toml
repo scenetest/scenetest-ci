@@ -91,6 +91,14 @@ RUNNER_PROVIDER = "stub"
 # first deploy; can be left as-is afterward (the bootstrap path is a no-op
 # once allowed_user is non-empty).
 BOOTSTRAP_ALLOWED_LOGIN = "mhsnook"
+# Hosted preview environments (docs/preview-environments.md): a PR whose
+# pipeline file declares a `preview` block waits for a Supabase preview branch,
+# then writes its keys to the project's Cloudflare preview Worker. Unset, a
+# declared preview fails the run with that reason.
+# PREVIEW_PROVIDER = "supabase-cloudflare"
+# CLOUDFLARE_ACCOUNT_ID = "dd3bee1c1159eb67e1a2249f83e2b4c4"
+# PREVIEW_TIMEOUT_MINUTES = "20"
+# PREVIEW_POLL_SECONDS = "20"
 # DEV-ONLY: when "1", unlocks /api/debug/stub-run which fabricates runs
 # without bearer auth. Defaults off so `wrangler deploy` is safe; enable
 # locally via .dev.vars (see .dev.vars.example).
@@ -101,6 +109,8 @@ ENABLE_DEBUG_ROUTES = "0"
 #   GITHUB_WEBHOOK_SECRET
 #   SESSION_SECRET
 #   DO_API_TOKEN          (only when RUNNER_PROVIDER = "digitalocean")
+#   SUPABASE_ACCESS_TOKEN (only when PREVIEW_PROVIDER = "supabase-cloudflare")
+#   CLOUDFLARE_API_TOKEN  (only when PREVIEW_PROVIDER = "supabase-cloudflare")
 
 # Production environment — deploy with: wrangler deploy --env production
 # Vars here replace (not merge with) the top-level [vars] block.

@@ -49,6 +49,11 @@ one repo-side contract; editing it re-runs the pipeline like any other edit
 to this file. When omitted it falls back to the legacy hook,
 `bash scenetest/box-run.sh`.
 
+An optional top-level `preview` block says the scenes run against a hosted
+preview — a Cloudflare Worker backed by a Supabase preview branch — instead of
+a server this box started. The run then waits for that environment before any
+scene executes. Fields and setup: docs/preview-environments.md.
+
 The box runs this command at the repo root and sets these for it:
 
 | Variable | Meaning |

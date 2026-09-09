@@ -16,6 +16,7 @@ describe('parsePipeline', () => {
     expect(cfg).toEqual({
       version: 1,
       stages: [{ name: 'deps', watch: ['**'], run: 'pnpm i' }],
+      preview: null,
       scenes: 'bash scenetest/box-run.sh',
     })
   })
@@ -127,6 +128,7 @@ describe('firstDivergentStage', () => {
     vector,
     stages: Object.keys(vector).map((name) => ({ name })),
     scenes: 'bash scenetest/box-run.sh',
+    preview: null,
     coarse: false,
   })
 

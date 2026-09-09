@@ -257,6 +257,9 @@ async function main() {
     '--var', `GITHUB_WEBHOOK_SECRET:${WEBHOOK_SECRET}`,
     '--var', 'GITHUB_OAUTH_CLIENT_SECRET:e2e-dummy',
     '--var', 'ENABLE_DEBUG_ROUTES:1',
+    // Preview environments resolve without Supabase or Cloudflare. Only a PR
+    // that opens one is affected, and only the block below opens one.
+    '--var', 'PREVIEW_PROVIDER:stub',
   ], { stdio: ['ignore', 'ignore', 'pipe'] })
   let serverErr = ''
   server.stderr.on('data', (d) => { serverErr += d })
@@ -298,7 +301,7 @@ async function main() {
   const prPayload = (repo, n, sha) => ({
     action: 'opened', number: n,
     repository: { full_name: repo },
-    pull_request: { state: 'open', head: { sha }, base: { ref: 'main', sha: 'base000' } },
+    pull_request: { state: 'open', head: { sha, ref: `pr-${n}` }, base: { ref: 'main', sha: 'base000' } },
   })
 
   check('bad signature → 401', (await hook('ping', {}, { badSig: true })).status === 401)
@@ -873,6 +876,60 @@ async function main() {
     JSON.stringify(reFold.ids) === JSON.stringify(preReset.ids),
     `before=${JSON.stringify(preReset.ids)} after=${JSON.stringify(reFold.ids)}`)
   check('re-fold preserves the per-run seq', reFold.seqs.includes(1) && reFold.seqs.includes(3))
+
+  // --- preview environment gate ---------------------------------------------
+  // A PR whose pipeline declares a hosted preview waits for it: batches queue
+  // even with the box connected, and are released — carrying the environment's
+  // variables — the moment it turns ready. The polls are driven by hand, the
+  // way idle teardown is, rather than by timing the alarm.
+  console.log('· preview environment gate')
+  d1Query(persistDir,
+    "INSERT INTO prs (repo, pr_number, head_sha, head_ref, base_ref, state, opened_at, updated_at) VALUES ('demo/watched', 14, 'prevbox1', 'feat/preview', 'main', 'open', 0, 0)")
+  d1Query(persistDir,
+    `INSERT INTO boxes (id, repo, pr_number, head_sha, status, bearer_token_hash, created_at) VALUES ('e2e-box-preview', 'demo/watched', 14, 'prevbox1', 'ready', '${boxTokenHash}', 0)`)
+  d1Query(persistDir,
+    "INSERT INTO runs (id, repo, pr_number, head_sha, trigger, status, box_id) VALUES ('e2e-preview-run', 'demo/watched', 14, 'prevbox1', 'manual', 'queued', 'e2e-box-preview')")
+
+  const { ws: prevBox, wait: waitPrevInbox } = await openBoxChannel('e2e-box-preview', boxToken, 'preview box')
+  const previewPost = (path, body) =>
+    fetch(`${BASE}/api/debug/${path}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ repo: 'demo/watched', prNumber: 14, ...body }),
+    })
+
+  const opened = await previewPost('preview-start', { gitBranch: 'feat/preview' })
+  check('preview environment opens as building',
+    opened.status === 202 && (await j(opened)).status === 'building')
+
+  const heldDispatch = await previewPost('box-dispatch', {
+    boxId: 'e2e-box-preview',
+    run: { runId: 'e2e-preview-run', boxId: 'e2e-box-preview', repo: 'demo/watched', prNumber: 14, headSha: 'prevbox1', subset: null },
+  })
+  check('dispatch is held while the preview builds, even with the box connected',
+    (await j(heldDispatch)).delivered === false)
+  check('the box is sent nothing while it waits',
+    (await waitPrevInbox((m) => m.kind === 'dispatch', 500)) === null)
+
+  // The stub resolves on its second poll; opening the environment already
+  // spent the first. Poll to ready rather than counting them.
+  let previewStatus = 'building'
+  for (let poll = 0; poll < 5 && previewStatus !== 'ready'; poll++) {
+    previewStatus = (await j(await previewPost('preview-step'))).status
+  }
+  check('polling drives the environment to ready', previewStatus === 'ready', previewStatus)
+
+  const released = await waitPrevInbox((m) => m.kind === 'dispatch')
+  check('the held dispatch is released once the preview is ready', released !== null)
+  check('the released dispatch carries the environment',
+    released?.env?.SCENETEST_PREVIEW_URL === 'https://stub-preview-pr-14.stub.workers.dev',
+    JSON.stringify(released?.env))
+
+  const previewBody = await j(await fetch(`${BASE}/api/debug/preview?repo=demo/watched&prNumber=14`))
+  check('the environment is recorded for the PR\'s later runs',
+    previewBody.row?.status === 'ready' && previewBody.gate?.status === 'ready',
+    JSON.stringify(previewBody))
+  prevBox.close()
 
   // --- idle teardown: the coordinator's alarm retires a box once idle --------
   // #30: activity-based retirement replaces the age cap. The PR object resets a

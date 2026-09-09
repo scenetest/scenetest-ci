@@ -4,6 +4,7 @@ import { hashToken } from '../middleware/bearer.ts'
 import { getRunner } from './registry.ts'
 import { prCoordinator } from '../do/pr-coordinator.ts'
 import { computeStagePlan, firstDivergentStage, type StagePlan } from './pipeline.ts'
+import { previewTimeoutMs, startPreview } from '../preview/reconcile.ts'
 
 export interface PrRef {
   repo: string // 'owner/name'
@@ -11,6 +12,9 @@ export interface PrRef {
   headSha: string
   baseSha: string | null
   baseRef: string
+  // The PR's own branch name. Supabase matches a preview branch to a git
+  // branch by name, so a preview environment can't be found without it.
+  headRef?: string
 }
 
 export interface BoxRow {
@@ -53,6 +57,7 @@ export async function ensureBox(
   }
 
   const plan = await computeStagePlan(env, pr.repo, pr.headSha)
+  await openPreview(env, pr, plan)
 
   if (live) {
     const realized = live.realized_stages
@@ -92,6 +97,30 @@ export async function ensureBox(
   // FIFO queue ahead of any dispatches, delivered when the agent connects.
   await queueUpdate(env, pr, plan, 0)
   return box
+}
+
+// Open this PR's hosted preview environment, if its pipeline file declares
+// one, and tell the PR object to hold the PR's dispatches until it is ready.
+// A no-op for a repo with no `preview` block, which is every repo that serves
+// its app from the box. The stub runner never gets here: it computes no stage
+// plan, so it reads no pipeline file (dev and e2e open a preview through
+// /api/debug/preview-start instead).
+async function openPreview(env: Env, pr: PrRef, plan: StagePlan | null): Promise<void> {
+  const gated = await startPreview(env, {
+    repo: pr.repo,
+    prNumber: pr.prNumber,
+    headSha: pr.headSha,
+    gitBranch: pr.headRef ?? '',
+  }, plan?.preview ?? null)
+  if (!gated) return
+  await prCoordinator(env, pr.repo, pr.prNumber).fetch('https://do/preview-start', {
+    method: 'POST',
+    body: JSON.stringify({
+      repo: pr.repo,
+      prNumber: pr.prNumber,
+      deadline: Date.now() + previewTimeoutMs(env),
+    }),
+  })
 }
 
 async function queueUpdate(env: Env, pr: PrRef, plan: StagePlan, fromStage: number): Promise<void> {

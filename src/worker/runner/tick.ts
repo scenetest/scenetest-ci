@@ -4,6 +4,7 @@ import { hashToken } from '../middleware/bearer.ts'
 import { advanceImageBuilds, ensureImage } from './image.ts'
 import { provisionDroplet, reapRunners } from './digitalocean.ts'
 import { prCoordinator } from '../do/pr-coordinator.ts'
+import { previewProvider } from '../preview/reconcile.ts'
 
 // The scheduled heartbeat (wrangler.toml [triggers]): walk every async chain
 // forward one step. Order matters — builds first (they may unblock boxes),
@@ -16,6 +17,11 @@ export async function tick(env: Env): Promise<void> {
   // pruned here: the log lives in the object's SQLite, never in D1.
   await archiveTerminalRuns(env).catch((err) => {
     console.error(`tick: archive backstop failed: ${err instanceof Error ? err.message : err}`)
+  })
+  // Preview environments are provider-independent: a PR waiting on one is
+  // waiting whatever its box runs on.
+  await advanceStalePreviews(env).catch((err) => {
+    console.error(`tick: preview backstop failed: ${err instanceof Error ? err.message : err}`)
   })
   if (env.RUNNER_PROVIDER !== 'digitalocean' || !env.DO_API_TOKEN) return
   await advanceImageBuilds(env)
@@ -40,6 +46,31 @@ async function archiveTerminalRuns(env: Env): Promise<void> {
       })
     } catch (err) {
       console.error(`tick: archiving ${row.id} failed: ${err instanceof Error ? err.message : err}`)
+    }
+  }
+}
+
+// A preview environment's poll schedule belongs to its PR object's alarm.
+// This is the backstop for an object that lost the alarm (a crash between the
+// storage write and the alarm write, an eviction mid-step): anything still
+// building and untouched for well past a poll interval gets one poke.
+const PREVIEW_STALE_MS = 5 * 60_000
+
+async function advanceStalePreviews(env: Env): Promise<void> {
+  if (!previewProvider(env)) return
+  const stale = await env.DB.prepare(
+    `SELECT repo, pr_number FROM preview_envs
+       WHERE status = 'building' AND updated_at < ?1 LIMIT 50`,
+  )
+    .bind(Date.now() - PREVIEW_STALE_MS)
+    .all<{ repo: string; pr_number: number }>()
+  for (const row of stale.results ?? []) {
+    try {
+      await prCoordinator(env, row.repo, row.pr_number).fetch('https://do/preview-step', {
+        method: 'POST',
+      })
+    } catch (err) {
+      console.error(`tick: preview step ${row.repo}#${row.pr_number} failed: ${err instanceof Error ? err.message : err}`)
     }
   }
 }
