@@ -13,7 +13,6 @@ const CONFIG: PreviewConfig = {
     worker: 'sunlo-pr-{pr}',
     secrets: { SUPABASE_URL: 'url', SUPABASE_SERVICE_ROLE_KEY: 'service_role_key' },
   },
-  sceneEnv: { BASE_URL: 'preview_url', VITE_SUPABASE_ANON_KEY: 'anon_key' },
 }
 
 function row(over: Record<string, unknown> = {}) {
@@ -27,7 +26,6 @@ function row(over: Record<string, unknown> = {}) {
     branch_ref: null,
     worker_name: null,
     preview_url: null,
-    scene_env_json: null,
     last_error: null,
     attempts: 0,
     deadline: Date.now() + 600_000,
@@ -123,14 +121,14 @@ describe('stepPreview', () => {
 
   it('reports a settled environment without touching either API', async () => {
     const { env } = fakeEnv(
-      row({ status: 'ready', scene_env_json: JSON.stringify({ BASE_URL: 'https://w.dev' }), preview_url: 'https://w.dev' }),
+      row({ status: 'ready', branch_ref: 'previewrefpreviewref', worker_name: 'sunlo-pr-42' }),
     )
     scriptFetch([])
     const state = await stepPreview(env, 'mhsnook/sunlo', 42)
     expect(state).toEqual({
       status: 'ready',
-      env: { BASE_URL: 'https://w.dev' },
-      previewUrl: 'https://w.dev',
+      branchRef: 'previewrefpreviewref',
+      workerName: 'sunlo-pr-42',
       error: null,
     })
   })
@@ -153,6 +151,10 @@ describe('stepPreview', () => {
     const { env } = fakeEnv(row())
     scriptFetch([
       ['api.supabase.com/v1/projects/abcdefghijklmnopqrst/branches', [healthyBranch]],
+      ['/api-keys', [
+        { name: 'anon', type: 'legacy', api_key: 'anon-key' },
+        { name: 'service_role', type: 'legacy', api_key: 'service-key' },
+      ]],
       ['workers/scripts/sunlo-pr-42', { success: false }, 404],
     ])
     const state = await stepPreview(env, 'mhsnook/sunlo', 42)
@@ -160,13 +162,12 @@ describe('stepPreview', () => {
     expect(state?.error).toContain('sunlo-pr-42')
   })
 
-  it('writes the branch keys to the Worker and hands the scenes their variables', async () => {
+  it('writes the branch keys to the Worker', async () => {
     const { env, calls } = fakeEnv(row())
     const seen = scriptFetch([
       ['api.supabase.com/v1/projects/abcdefghijklmnopqrst/branches', [healthyBranch]],
       ['workers/scripts/sunlo-pr-42/secrets', cf({ name: 'x', type: 'secret_text' })],
       ['workers/scripts/sunlo-pr-42', cf({ id: 'sunlo-pr-42' })],
-      ['workers/subdomain', cf({ subdomain: 'mhsnook' })],
       ['/v1/branches/previewrefpreviewref', {
         ref: 'previewrefpreviewref',
         status: 'ACTIVE_HEALTHY',
@@ -183,28 +184,61 @@ describe('stepPreview', () => {
 
     const state = await stepPreview(env, 'mhsnook/sunlo', 42)
 
-    expect(state?.status).toBe('ready')
-    expect(state?.env).toEqual({
-      BASE_URL: 'https://sunlo-pr-42.mhsnook.workers.dev',
-      VITE_SUPABASE_ANON_KEY: 'anon-key',
-    })
+    expect(state).toMatchObject({ status: 'ready', branchRef: 'previewrefpreviewref', workerName: 'sunlo-pr-42' })
     const secrets = seen.filter((r) => r.url.includes('/secrets'))
     expect(secrets.map((r) => r.body)).toEqual([
       { name: 'SUPABASE_URL', text: 'https://previewrefpreviewref.supabase.co', type: 'secret_text' },
       { name: 'SUPABASE_SERVICE_ROLE_KEY', text: 'service-key', type: 'secret_text' },
     ])
-    // The service role key reaches the Worker and stops there.
+    // The keys reach the Worker and stop there.
     expect(JSON.stringify(writes(calls))).not.toContain('service-key')
+    expect(JSON.stringify(writes(calls))).not.toContain('anon-key')
+    // No secret asks for the preview URL, so the subdomain is never fetched.
+    expect(seen.some((r) => r.url.includes('workers/subdomain'))).toBe(false)
   })
 
-  it('fails the environment when the branch fails its migrations', async () => {
+  it('hands over the keys without waiting for the branch migrations', async () => {
     const { env } = fakeEnv(row())
     scriptFetch([
-      ['api.supabase.com/v1/projects/abcdefghijklmnopqrst/branches', [{ ...healthyBranch, status: 'MIGRATIONS_FAILED' }]],
+      ['api.supabase.com/v1/projects/abcdefghijklmnopqrst/branches', [
+        { ...healthyBranch, status: 'RUNNING_MIGRATIONS', preview_project_status: 'COMING_UP' },
+      ]],
+      ['workers/scripts/sunlo-pr-42/secrets', cf({ name: 'x', type: 'secret_text' })],
+      ['workers/scripts/sunlo-pr-42', cf({ id: 'sunlo-pr-42' })],
+      ['/v1/branches/previewrefpreviewref', {
+        ref: 'previewrefpreviewref', status: 'COMING_UP', db_host: 'db.x', db_port: 5432,
+      }],
+      ['/api-keys', [
+        { name: 'anon', type: 'legacy', api_key: 'anon-key' },
+        { name: 'service_role', type: 'legacy', api_key: 'service-key' },
+      ]],
+    ])
+    expect((await stepPreview(env, 'mhsnook/sunlo', 42))?.status).toBe('ready')
+  })
+
+  it('waits while the branch has no keys to give yet', async () => {
+    const { env } = fakeEnv(row())
+    scriptFetch([
+      ['api.supabase.com/v1/projects/abcdefghijklmnopqrst/branches', [
+        { ...healthyBranch, status: 'CREATING_PROJECT', preview_project_status: 'COMING_UP' },
+      ]],
+      ['/api-keys', { message: 'project not ready' }, 503],
+    ])
+    const state = await stepPreview(env, 'mhsnook/sunlo', 42)
+    expect(state?.status).toBe('building')
+    expect(state?.error).toContain('no keys yet')
+  })
+
+  it('fails the environment when the branch project never comes up', async () => {
+    const { env } = fakeEnv(row())
+    scriptFetch([
+      ['api.supabase.com/v1/projects/abcdefghijklmnopqrst/branches', [
+        { ...healthyBranch, preview_project_status: 'INIT_FAILED' },
+      ]],
     ])
     const state = await stepPreview(env, 'mhsnook/sunlo', 42)
     expect(state?.status).toBe('failed')
-    expect(state?.error).toContain('MIGRATIONS_FAILED')
+    expect(state?.error).toContain('INIT_FAILED')
   })
 
   it('keeps waiting through a transient API failure', async () => {
@@ -248,7 +282,6 @@ describe('stepPreview', () => {
       'mhsnook/sunlo',
       42,
     )
-    expect(second?.status).toBe('ready')
-    expect(second?.env.BASE_URL).toBe('https://sunlo-pr-42.stub.workers.dev')
+    expect(second).toMatchObject({ status: 'ready', workerName: 'sunlo-pr-42' })
   })
 })

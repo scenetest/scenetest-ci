@@ -1,28 +1,28 @@
 import type { Env } from '../env.ts'
-import {
-  renderFieldMap,
-  renderWorkerName,
-  type PreviewConfig,
-  type PreviewValues,
-} from './config.ts'
+import { renderWorkerName, type PreviewConfig, type PreviewValues } from './config.ts'
 import * as cf from './cloudflare.ts'
 import * as sb from './supabase.ts'
+import { postCommitStatus } from '../github.ts'
 
-// One PR, one hosted preview environment: a Supabase preview branch and the
-// Cloudflare Worker that talks to it. This module is the whole state machine,
-// and `stepPreview` is one step of it — it never waits, so a caller drives it
-// from an alarm and asks again later (docs/preview-environments.md).
+// One PR, one hosted preview environment: a Supabase preview branch, and the
+// project's Cloudflare preview Worker pointed at it. This module is the whole
+// state machine, and `stepPreview` is one step of it — it never waits, so a
+// caller drives it from an alarm and asks again later
+// (docs/preview-environments.md).
 //
-// The reconciler owns no schedule and no gate. The PR coordinator polls it and
-// decides what to do with the answer.
+// What it waits for is the branch's *keys*, not its schema. Keys exist as
+// soon as the branch project does and do not change when migrations run, so
+// holding the Worker's secrets back until the migrations pass would delay the
+// handover for nothing.
+//
+// The reconciler owns no schedule. The preview coordinator polls it.
 
 export type PreviewStatus = 'building' | 'ready' | 'failed'
 
 export interface PreviewState {
   status: PreviewStatus
-  // The variables the scenes command runs with, once ready.
-  env: Record<string, string>
-  previewUrl: string | null
+  branchRef: string | null
+  workerName: string | null
   error: string | null
 }
 
@@ -34,10 +34,11 @@ export interface PreviewRef {
 }
 
 const DEFAULT_TIMEOUT_MINUTES = 20
+const DEFAULT_POLL_SECONDS = 20
 
 // 'stub' resolves a declared environment without calling Supabase or
-// Cloudflare: ready after one poll, with values that name themselves. It is
-// how dev and the e2e exercise the gate, the alarm and the dispatch env.
+// Cloudflare: ready after one poll. It is how dev and the e2e drive the
+// machine end to end.
 export function previewProvider(env: Env): 'supabase-cloudflare' | 'stub' | null {
   const p = env.PREVIEW_PROVIDER
   return p === 'supabase-cloudflare' || p === 'stub' ? p : null
@@ -48,17 +49,22 @@ export function previewTimeoutMs(env: Env): number {
   return (Number.isFinite(minutes) && minutes > 0 ? minutes : DEFAULT_TIMEOUT_MINUTES) * 60_000
 }
 
+export function previewPollMs(env: Env): number {
+  const seconds = Number(env.PREVIEW_POLL_SECONDS ?? DEFAULT_POLL_SECONDS)
+  return (Number.isFinite(seconds) && seconds > 0 ? seconds : DEFAULT_POLL_SECONDS) * 1000
+}
+
 interface PreviewRow {
   repo: string
   pr_number: number
   git_branch: string
+  head_sha: string
   config_json: string
   status: PreviewStatus
   branch_id: string | null
   branch_ref: string | null
   worker_name: string | null
   preview_url: string | null
-  scene_env_json: string | null
   last_error: string | null
   attempts: number
   deadline: number
@@ -73,17 +79,17 @@ async function loadRow(env: Env, repo: string, prNumber: number): Promise<Previe
 function rowState(row: PreviewRow): PreviewState {
   return {
     status: row.status,
-    env: row.scene_env_json ? (JSON.parse(row.scene_env_json) as Record<string, string>) : {},
-    previewUrl: row.preview_url,
+    branchRef: row.branch_ref,
+    workerName: row.worker_name,
     error: row.last_error,
   }
 }
 
 // Open (or re-open) this PR's preview environment for a new head sha, and say
-// whether runs on this PR now wait for one. A push re-opens an environment
-// that was already ready: Supabase re-runs the branch's migrations and the
-// project redeploys its Worker, so the values have to be re-read even when
-// the branch itself survives.
+// whether there is one to poll. A push re-opens an environment that was
+// already ready: the branch re-runs its migrations and the project redeploys
+// its Worker, and a redeployed Worker is a Worker whose secrets are worth
+// writing again.
 export async function startPreview(
   env: Env,
   ref: PreviewRef,
@@ -117,6 +123,24 @@ export async function startPreview(
   return true
 }
 
+// Nothing waits on a preview environment, so its outcome has to say so
+// somewhere a person looks. It gets its own commit-status context: a preview
+// that failed is a fact about the environment, never a verdict on the code,
+// and the two must not overwrite each other.
+const STATUS_CONTEXT = 'scenetest/preview'
+
+async function report(env: Env, row: PreviewRow, status: string, description: string): Promise<void> {
+  await postCommitStatus(env, {
+    repo: row.repo,
+    sha: row.head_sha,
+    status,
+    description,
+    context: STATUS_CONTEXT,
+  }).catch((err) =>
+    console.error(`preview status(${row.repo}#${row.pr_number}) failed: ${err instanceof Error ? err.message : err}`),
+  )
+}
+
 async function fail(env: Env, row: PreviewRow, error: string): Promise<PreviewState> {
   await env.DB.prepare(
     `UPDATE preview_envs SET status = 'failed', last_error = ?1, updated_at = ?2
@@ -124,7 +148,8 @@ async function fail(env: Env, row: PreviewRow, error: string): Promise<PreviewSt
   )
     .bind(error, Date.now(), row.repo, row.pr_number)
     .run()
-  return { status: 'failed', env: {}, previewUrl: row.preview_url, error }
+  await report(env, row, 'failed', `Preview environment failed: ${error}`)
+  return { status: 'failed', branchRef: row.branch_ref, workerName: row.worker_name, error }
 }
 
 async function waiting(
@@ -151,35 +176,32 @@ async function waiting(
       row.pr_number,
     )
     .run()
-  return { status: 'building', env: {}, previewUrl: null, error: note }
+  return {
+    status: 'building',
+    branchRef: patch.branch_ref ?? row.branch_ref,
+    workerName: patch.worker_name ?? row.worker_name,
+    error: note,
+  }
 }
 
 async function ready(
   env: Env,
   row: PreviewRow,
-  values: PreviewValues,
-  config: PreviewConfig,
+  branchRef: string,
   worker: string,
+  previewUrl: string | null,
 ): Promise<PreviewState> {
-  const sceneEnv = renderFieldMap(config.sceneEnv, values)
   const now = Date.now()
   await env.DB.prepare(
     `UPDATE preview_envs
-       SET status = 'ready', scene_env_json = ?1, preview_url = ?2, worker_name = ?3,
-           branch_ref = ?4, last_error = NULL, ready_at = ?5, updated_at = ?5
-     WHERE repo = ?6 AND pr_number = ?7`,
+       SET status = 'ready', preview_url = ?1, worker_name = ?2, branch_ref = ?3,
+           last_error = NULL, ready_at = ?4, updated_at = ?4
+     WHERE repo = ?5 AND pr_number = ?6`,
   )
-    .bind(
-      JSON.stringify(sceneEnv),
-      values.preview_url,
-      worker,
-      values.branch_ref,
-      now,
-      row.repo,
-      row.pr_number,
-    )
+    .bind(previewUrl, worker, branchRef, now, row.repo, row.pr_number)
     .run()
-  return { status: 'ready', env: sceneEnv, previewUrl: values.preview_url, error: null }
+  await report(env, row, 'passed', `Preview environment ready on ${worker}`)
+  return { status: 'ready', branchRef, workerName: worker, error: null }
 }
 
 // Advance this PR's preview environment by one step and report where it got
@@ -201,7 +223,11 @@ export async function stepPreview(env: Env, repo: string, prNumber: number): Pro
     )
   }
   if (Date.now() > row.deadline) {
-    return fail(env, row, `preview environment timed out after ${Math.round(previewTimeoutMs(env) / 60_000)}m: ${row.last_error ?? 'still building'}`)
+    return fail(
+      env,
+      row,
+      `preview environment timed out after ${Math.round(previewTimeoutMs(env) / 60_000)}m: ${row.last_error ?? 'still building'}`,
+    )
   }
   if (provider === 'stub') return stubStep(env, row, config)
 
@@ -222,35 +248,39 @@ export async function stepPreview(env: Env, repo: string, prNumber: number): Pro
         ...(config.supabase.region ? { region: config.supabase.region } : {}),
       }))
 
-    const phase = sb.branchPhase(branch)
-    if (phase === 'failed') {
+    if (sb.branchDead(branch)) {
       return fail(
         env,
         row,
-        `Supabase branch ${branch.project_ref} failed: ${branch.status ?? branch.preview_project_status ?? 'unknown'}`,
+        `Supabase branch ${branch.project_ref} is ${branch.preview_project_status ?? branch.status ?? 'gone'}`,
       )
-    }
-    if (phase === 'building') {
-      return waiting(env, row, `Supabase branch ${branch.project_ref} is ${branch.preview_project_status ?? branch.status ?? 'building'}`, {
-        branch_id: branch.id,
-        branch_ref: branch.project_ref,
-      })
     }
 
     const worker = renderWorkerName(config.cloudflare.worker, prNumber, row.git_branch)
-    if (!(await cf.workerExists(env, worker))) {
-      return waiting(env, row, `Cloudflare Worker ${worker} is not deployed yet`, {
-        branch_id: branch.id,
-        branch_ref: branch.project_ref,
-        worker_name: worker,
-      })
+    const found = { branch_id: branch.id, branch_ref: branch.project_ref, worker_name: worker }
+
+    // The gate on the whole handover: keys the branch project will answer
+    // with. They appear once the branch project exists and do not change when
+    // its migrations run, so this is as early as the Worker can be pointed at
+    // a database that will answer it.
+    const keys = await sb.getApiKeys(env, branch.project_ref).catch((err) => {
+      console.log(`preview: ${branch.project_ref} has no keys yet: ${err instanceof Error ? err.message : err}`)
+      return null
+    })
+    if (!keys) {
+      return waiting(env, row, `Supabase branch ${branch.project_ref} has no keys yet`, found)
     }
 
-    const [detail, keys, subdomain] = await Promise.all([
+    if (!(await cf.workerExists(env, worker))) {
+      return waiting(env, row, `Cloudflare Worker ${worker} is not deployed yet`, found)
+    }
+
+    const needsUrl = Object.values(config.cloudflare.secrets).includes('preview_url')
+    const [detail, subdomain] = await Promise.all([
       sb.getBranch(env, branch.project_ref),
-      sb.getApiKeys(env, branch.project_ref),
-      cf.accountSubdomain(env),
+      needsUrl ? cf.accountSubdomain(env) : Promise.resolve(null),
     ])
+    const previewUrl = subdomain ? cf.workersDevUrl(worker, subdomain) : null
 
     const values: PreviewValues = {
       url: sb.projectUrl(branch.project_ref),
@@ -258,7 +288,7 @@ export async function stepPreview(env: Env, repo: string, prNumber: number): Pro
       service_role_key: keys.serviceRoleKey,
       db_url: sb.dbUrl(detail),
       branch_ref: branch.project_ref,
-      preview_url: cf.workersDevUrl(worker, subdomain),
+      preview_url: previewUrl ?? '',
       pr: String(prNumber),
       branch: row.git_branch,
     }
@@ -269,34 +299,25 @@ export async function stepPreview(env: Env, repo: string, prNumber: number): Pro
       await cf.putSecret(env, worker, name, values[field])
     }
 
-    return ready(env, row, values, config, worker)
+    return ready(env, row, branch.project_ref, worker, previewUrl)
   } catch (err) {
     // Transient by assumption: the deadline is what makes a repeated failure
-    // terminal, so a rate limit or a 502 costs one poll, not the run.
+    // terminal, so a rate limit or a 502 costs one poll, not the environment.
     return waiting(env, row, err instanceof Error ? err.message : String(err))
   }
 }
 
 async function stubStep(env: Env, row: PreviewRow, config: PreviewConfig): Promise<PreviewState> {
-  if (row.attempts < 1) return waiting(env, row, 'stub preview building')
-  const branchRef = `stub-${row.pr_number}`
   const worker = renderWorkerName(config.cloudflare.worker, row.pr_number, row.git_branch)
-  return ready(
-    env,
-    row,
-    {
-      url: `https://${branchRef}.supabase.stub`,
-      anon_key: 'stub-anon-key',
-      service_role_key: 'stub-service-role-key',
-      db_url: `postgresql://postgres:stub@127.0.0.1:5432/${branchRef}`,
+  const branchRef = `stub-${row.pr_number}`
+  if (row.attempts < 1) {
+    return waiting(env, row, 'stub branch has no keys yet', {
+      branch_id: `stub-branch-${row.pr_number}`,
       branch_ref: branchRef,
-      preview_url: `https://${worker}.stub.workers.dev`,
-      pr: String(row.pr_number),
-      branch: row.git_branch,
-    },
-    config,
-    worker,
-  )
+      worker_name: worker,
+    })
+  }
+  return ready(env, row, branchRef, worker, `https://${worker}.stub.workers.dev`)
 }
 
 export async function getPreview(env: Env, repo: string, prNumber: number): Promise<PreviewState | null> {

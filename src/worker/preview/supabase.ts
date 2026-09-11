@@ -28,25 +28,16 @@ export interface SupabaseBranchDetail {
   db_pass?: string
 }
 
-export type BranchPhase = 'building' | 'ready' | 'failed'
+const PROJECT_DEAD = new Set(['INIT_FAILED', 'RESTORE_FAILED', 'PAUSE_FAILED', 'REMOVED'])
 
-const MIGRATIONS_FAILED = new Set(['MIGRATIONS_FAILED', 'FUNCTIONS_FAILED'])
-const MIGRATIONS_DONE = new Set(['MIGRATIONS_PASSED', 'FUNCTIONS_DEPLOYED'])
-const PROJECT_FAILED = new Set(['INIT_FAILED', 'RESTORE_FAILED', 'PAUSE_FAILED', 'REMOVED'])
-
-// Two independent signals have to agree before a branch is usable: the branch
-// project is healthy, and its migrations ran. A branch reports ACTIVE_HEALTHY
-// while migrations are still running, so health alone would hand out a
-// database with no schema in it.
-export function branchPhase(branch: SupabaseBranch): BranchPhase {
-  const migration = branch.status
+// A branch that will never answer: its project failed to come up, or it is
+// gone. Anything else — coming up, restoring, mid-migration — is a branch
+// worth asking again, because the keys this feature waits for do not depend
+// on the schema. A failed *migration* is not dead: the branch project still
+// serves, with whatever schema it got.
+export function branchDead(branch: SupabaseBranch): boolean {
   const project = branch.preview_project_status
-  if ((migration && MIGRATIONS_FAILED.has(migration)) || (project && PROJECT_FAILED.has(project))) {
-    return 'failed'
-  }
-  if (project !== 'ACTIVE_HEALTHY') return 'building'
-  if (migration && !MIGRATIONS_DONE.has(migration)) return 'building'
-  return 'ready'
+  return project !== undefined && PROJECT_DEAD.has(project)
 }
 
 async function call<T>(env: Env, path: string, init: RequestInit = {}): Promise<T> {

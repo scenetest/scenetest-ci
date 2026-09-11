@@ -4,7 +4,8 @@ import { hashToken } from '../middleware/bearer.ts'
 import { getRunner } from './registry.ts'
 import { prCoordinator } from '../do/pr-coordinator.ts'
 import { computeStagePlan, firstDivergentStage, type StagePlan } from './pipeline.ts'
-import { previewTimeoutMs, startPreview } from '../preview/reconcile.ts'
+import { startPreview } from '../preview/reconcile.ts'
+import { previewCoordinator } from '../do/preview-coordinator.ts'
 
 export interface PrRef {
   repo: string // 'owner/name'
@@ -100,26 +101,23 @@ export async function ensureBox(
 }
 
 // Open this PR's hosted preview environment, if its pipeline file declares
-// one, and tell the PR object to hold the PR's dispatches until it is ready.
-// A no-op for a repo with no `preview` block, which is every repo that serves
-// its app from the box. The stub runner never gets here: it computes no stage
-// plan, so it reads no pipeline file (dev and e2e open a preview through
-// /api/debug/preview-start instead).
+// one: its own object then polls the Supabase branch to ready and writes its
+// keys to the project's Cloudflare Worker. Nothing here waits on that, and
+// nothing about it reaches the box — the run proceeds exactly as it would
+// without a preview. A no-op for a repo with no `preview` block. The stub
+// runner never gets here: it computes no stage plan, so it reads no pipeline
+// file (dev and e2e open a preview through /api/debug/preview-start).
 async function openPreview(env: Env, pr: PrRef, plan: StagePlan | null): Promise<void> {
-  const gated = await startPreview(env, {
+  const opened = await startPreview(env, {
     repo: pr.repo,
     prNumber: pr.prNumber,
     headSha: pr.headSha,
     gitBranch: pr.headRef ?? '',
   }, plan?.preview ?? null)
-  if (!gated) return
-  await prCoordinator(env, pr.repo, pr.prNumber).fetch('https://do/preview-start', {
+  if (!opened) return
+  await previewCoordinator(env, pr.repo, pr.prNumber).fetch('https://do/start', {
     method: 'POST',
-    body: JSON.stringify({
-      repo: pr.repo,
-      prNumber: pr.prNumber,
-      deadline: Date.now() + previewTimeoutMs(env),
-    }),
+    body: JSON.stringify({ repo: pr.repo, prNumber: pr.prNumber }),
   })
 }
 

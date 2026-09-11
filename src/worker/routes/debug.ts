@@ -1,7 +1,8 @@
 import type { Handler } from '../router.ts'
 import { createRun } from '../runner/create-run.ts'
 import { prCoordinator } from '../do/pr-coordinator.ts'
-import { getPreview, previewTimeoutMs, startPreview } from '../preview/reconcile.ts'
+import { getPreview, startPreview } from '../preview/reconcile.ts'
+import { previewCoordinator } from '../do/preview-coordinator.ts'
 import type { PreviewConfig } from '../preview/config.ts'
 
 // Every handler here is registered through devOnly() in index.ts, so none of
@@ -129,8 +130,7 @@ export const debugStubRun: Handler = async (req, env, ctx) => {
 }
 
 // GET /api/debug/preview?repo=owner/name&prNumber=1
-// The PR's preview environment as both halves see it: the D1 row the
-// reconciler writes, and the gate the PR object holds dispatches on.
+// The PR's preview environment as its own object reports it.
 export const debugPreview: Handler = async (req, env) => {
   const url = new URL(req.url)
   const repo = url.searchParams.get('repo') ?? ''
@@ -138,16 +138,16 @@ export const debugPreview: Handler = async (req, env) => {
   if (!repo || !Number.isFinite(prNumber)) {
     return Response.json({ error: 'repo and prNumber required' }, { status: 400 })
   }
-  const resp = await prCoordinator(env, repo, prNumber).fetch('https://do/preview')
-  return Response.json({ row: await getPreview(env, repo, prNumber), gate: await resp.json() })
+  const resp = await previewCoordinator(env, repo, prNumber).fetch('https://do/state')
+  return Response.json({ row: await getPreview(env, repo, prNumber), object: await resp.json() })
 }
 
 // POST /api/debug/preview-step
 // Body: { repo, prNumber } — run one reconcile step now instead of waiting
-// for the PR object's alarm, so the e2e can drive a preview to ready.
+// for the preview object's alarm, so the e2e can drive one to ready.
 export const debugPreviewStep: Handler = async (req, env) => {
   const { repo, prNumber } = await req.json<{ repo: string; prNumber: number }>()
-  const resp = await prCoordinator(env, repo, prNumber).fetch('https://do/preview-step', {
+  const resp = await previewCoordinator(env, repo, prNumber).fetch('https://do/step', {
     method: 'POST',
   })
   return Response.json(await resp.json())
@@ -158,14 +158,13 @@ export const debugPreviewStep: Handler = async (req, env) => {
 // PREVIEW_PROVIDER=stub.
 const STUB_PREVIEW: PreviewConfig = {
   supabase: { projectRef: 'stubstubstubstubstub', withData: false },
-  cloudflare: { worker: 'stub-preview-pr-{pr}', secrets: {} },
-  sceneEnv: { SCENETEST_PREVIEW_URL: 'preview_url', SCENETEST_SUPABASE_URL: 'url' },
+  cloudflare: { worker: 'stub-preview-pr-{pr}', secrets: { SUPABASE_URL: 'url' } },
 }
 
 // POST /api/debug/preview-start
 // Body: { repo, prNumber, headSha?, gitBranch?, config? } — open a preview
-// environment for a PR without a pipeline file declaring one, so the gate can
-// be driven end to end against the stub provider.
+// environment for a PR without a pipeline file declaring one, so the machine
+// can be driven end to end against the stub provider.
 export const debugPreviewStart: Handler = async (req, env) => {
   const body = await req.json<{
     repo: string
@@ -186,13 +185,9 @@ export const debugPreviewStart: Handler = async (req, env) => {
   )
   if (!started) return Response.json({ error: 'preview not started' }, { status: 400 })
 
-  const resp = await prCoordinator(env, body.repo, body.prNumber).fetch('https://do/preview-start', {
+  const resp = await previewCoordinator(env, body.repo, body.prNumber).fetch('https://do/start', {
     method: 'POST',
-    body: JSON.stringify({
-      repo: body.repo,
-      prNumber: body.prNumber,
-      deadline: Date.now() + previewTimeoutMs(env),
-    }),
+    body: JSON.stringify({ repo: body.repo, prNumber: body.prNumber }),
   })
   return Response.json(await resp.json(), { status: 202 })
 }

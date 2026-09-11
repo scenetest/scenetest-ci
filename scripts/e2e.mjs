@@ -877,59 +877,66 @@ async function main() {
     `before=${JSON.stringify(preReset.ids)} after=${JSON.stringify(reFold.ids)}`)
   check('re-fold preserves the per-run seq', reFold.seqs.includes(1) && reFold.seqs.includes(3))
 
-  // --- preview environment gate ---------------------------------------------
-  // A PR whose pipeline declares a hosted preview waits for it: batches queue
-  // even with the box connected, and are released — carrying the environment's
-  // variables — the moment it turns ready. The polls are driven by hand, the
-  // way idle teardown is, rather than by timing the alarm.
-  console.log('· preview environment gate')
+  // --- preview environment ---------------------------------------------------
+  // A PR whose pipeline declares a hosted preview gets a Supabase branch and
+  // has its keys written to the project's Cloudflare Worker. Nothing about it
+  // touches the box or the run: this walks the environment to ready on its
+  // own, with the polls driven by hand rather than by timing the alarm.
+  console.log('· preview environment')
   d1Query(persistDir,
-    "INSERT INTO prs (repo, pr_number, head_sha, head_ref, base_ref, state, opened_at, updated_at) VALUES ('demo/watched', 14, 'prevbox1', 'feat/preview', 'main', 'open', 0, 0)")
-  d1Query(persistDir,
-    `INSERT INTO boxes (id, repo, pr_number, head_sha, status, bearer_token_hash, created_at) VALUES ('e2e-box-preview', 'demo/watched', 14, 'prevbox1', 'ready', '${boxTokenHash}', 0)`)
-  d1Query(persistDir,
-    "INSERT INTO runs (id, repo, pr_number, head_sha, trigger, status, box_id) VALUES ('e2e-preview-run', 'demo/watched', 14, 'prevbox1', 'manual', 'queued', 'e2e-box-preview')")
+    "INSERT INTO prs (repo, pr_number, head_sha, head_ref, base_ref, state, opened_at, updated_at) VALUES ('demo/watched', 14, 'prev1', 'feat/preview', 'main', 'open', 0, 0)")
 
-  const { ws: prevBox, wait: waitPrevInbox } = await openBoxChannel('e2e-box-preview', boxToken, 'preview box')
   const previewPost = (path, body) =>
     fetch(`${BASE}/api/debug/${path}`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ repo: 'demo/watched', prNumber: 14, ...body }),
     })
+  const previewRow = () =>
+    d1Query(persistDir, "SELECT status, branch_ref, worker_name FROM preview_envs WHERE pr_number = 14")[0]
 
   const opened = await previewPost('preview-start', { gitBranch: 'feat/preview' })
-  check('preview environment opens as building',
-    opened.status === 202 && (await j(opened)).status === 'building')
+  check('preview environment opens', opened.status === 202)
+  check('it starts out building', previewRow()?.status === 'building', JSON.stringify(previewRow()))
 
-  const heldDispatch = await previewPost('box-dispatch', {
-    boxId: 'e2e-box-preview',
-    run: { runId: 'e2e-preview-run', boxId: 'e2e-box-preview', repo: 'demo/watched', prNumber: 14, headSha: 'prevbox1', subset: null },
-  })
-  check('dispatch is held while the preview builds, even with the box connected',
-    (await j(heldDispatch)).delivered === false)
-  check('the box is sent nothing while it waits',
-    (await waitPrevInbox((m) => m.kind === 'dispatch', 500)) === null)
-
-  // The stub resolves on its second poll; opening the environment already
-  // spent the first. Poll to ready rather than counting them.
+  // The stub resolves on its second poll, and opening the environment arms an
+  // alarm that may already have spent the first. Poll to ready rather than
+  // counting them.
   let previewStatus = 'building'
   for (let poll = 0; poll < 5 && previewStatus !== 'ready'; poll++) {
     previewStatus = (await j(await previewPost('preview-step'))).status
   }
   check('polling drives the environment to ready', previewStatus === 'ready', previewStatus)
+  check('the branch and Worker are recorded for the next push',
+    previewRow()?.branch_ref === 'stub-14' && previewRow()?.worker_name === 'stub-preview-pr-14',
+    JSON.stringify(previewRow()))
 
-  const released = await waitPrevInbox((m) => m.kind === 'dispatch')
-  check('the held dispatch is released once the preview is ready', released !== null)
-  check('the released dispatch carries the environment',
-    released?.env?.SCENETEST_PREVIEW_URL === 'https://stub-preview-pr-14.stub.workers.dev',
-    JSON.stringify(released?.env))
-
-  const previewBody = await j(await fetch(`${BASE}/api/debug/preview?repo=demo/watched&prNumber=14`))
-  check('the environment is recorded for the PR\'s later runs',
-    previewBody.row?.status === 'ready' && previewBody.gate?.status === 'ready',
+  // A pooled connection can die between blocks (the local dev server bounces
+  // its connections; no production analog), so retry the bounce rather than
+  // reading it as a failed check.
+  const previewBody = await j(await (async () => {
+    for (let attempt = 1; ; attempt++) {
+      try {
+        return await fetch(`${BASE}/api/debug/preview?repo=demo/watched&prNumber=14`)
+      } catch (err) {
+        if (attempt >= 4 || !isBounce(err)) throw err
+        await new Promise((r) => setTimeout(r, 200 * attempt))
+      }
+    }
+  })())
+  check('the preview object and the row agree',
+    previewBody.row?.status === 'ready' && previewBody.object?.status === 'ready',
     JSON.stringify(previewBody))
-  prevBox.close()
+
+  // Closing the PR takes the environment with it.
+  await hook('pull_request', {
+    action: 'closed', number: 14,
+    repository: { full_name: 'demo/watched' },
+    pull_request: { state: 'closed', head: { sha: 'prev1', ref: 'feat/preview' }, base: { ref: 'main', sha: 'base000' } },
+  })
+  check('closing the PR drops its preview environment',
+    await waitFor(() => previewRow() === undefined),
+    JSON.stringify(previewRow()))
 
   // --- idle teardown: the coordinator's alarm retires a box once idle --------
   // #30: activity-based retirement replaces the age cap. The PR object resets a

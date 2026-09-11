@@ -5,10 +5,9 @@
 -- outlive any single run, like the box — so this table is keyed by PR, and
 -- the row is deleted when the PR closes.
 --
--- What is NOT here: the Supabase keys. The reconciler reads them, writes them
--- to the preview Worker, and drops them. Only the values the pipeline file
--- asks to hand to the scenes command are kept (scene_env_json), because every
--- later run on this PR needs them again.
+-- What is NOT here: anything the branch's keys unlock. The reconciler reads
+-- them, writes them to the preview Worker, and drops them; this table keeps
+-- only the refs and names needed to find the same branch and Worker again.
 CREATE TABLE preview_envs (
   repo TEXT NOT NULL,
   pr_number INTEGER NOT NULL,
@@ -19,12 +18,11 @@ CREATE TABLE preview_envs (
   branch_id TEXT,                -- Supabase branch uuid
   branch_ref TEXT,               -- the branch's own project ref ('<ref>.supabase.co')
   worker_name TEXT,              -- the Cloudflare Worker the secrets were written to
-  preview_url TEXT,              -- that Worker's workers.dev URL
-  scene_env_json TEXT,           -- resolved env handed to the box with each dispatch
+  preview_url TEXT,              -- that Worker's workers.dev URL, when a secret asks for it
   last_error TEXT,
   attempts INTEGER NOT NULL DEFAULT 0,
   started_at INTEGER NOT NULL,
-  deadline INTEGER NOT NULL,     -- give up here and fail the PR's runs
+  deadline INTEGER NOT NULL,     -- give up here and mark the environment failed
   ready_at INTEGER,
   updated_at INTEGER NOT NULL,
   PRIMARY KEY (repo, pr_number),

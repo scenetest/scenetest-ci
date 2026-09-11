@@ -25,6 +25,7 @@ import { tick } from './runner/tick.ts'
 
 export { PrCoordinator } from './do/pr-coordinator.ts'
 export { HomeCoordinator } from './do/home-coordinator.ts'
+export { PreviewCoordinator } from './do/preview-coordinator.ts'
 import {
   getGithubLogin,
   getGithubCallback,

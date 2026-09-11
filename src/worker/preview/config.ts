@@ -7,8 +7,8 @@
 // holds the current one.
 
 // The values a resolved preview environment offers. A pipeline file names
-// these on the right-hand side of `cloudflare.secrets` and `scene_env`; the
-// left-hand side is the environment variable the project wants them under.
+// these on the right-hand side of `cloudflare.secrets`; the left-hand side is
+// the environment variable the preview Worker wants them under.
 export const PREVIEW_FIELDS = [
   'url',
   'anon_key',
@@ -38,8 +38,6 @@ export interface PreviewConfig {
     // env var name → preview field, written as Worker secrets.
     secrets: Record<string, PreviewField>
   }
-  // env var name → preview field, handed to the scenes command on the box.
-  sceneEnv: Record<string, PreviewField>
 }
 
 function parseFieldMap(raw: unknown): Record<string, PreviewField> | null {
@@ -60,7 +58,7 @@ function parseFieldMap(raw: unknown): Record<string, PreviewField> | null {
 // half a preview fails mysteriously.
 export function parsePreview(raw: unknown): PreviewConfig | null {
   if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return null
-  const cfg = raw as { supabase?: unknown; cloudflare?: unknown; scene_env?: unknown }
+  const cfg = raw as { supabase?: unknown; cloudflare?: unknown }
 
   const sb = cfg.supabase as { project_ref?: unknown; with_data?: unknown; region?: unknown } | undefined
   if (!sb || typeof sb.project_ref !== 'string' || !/^[a-z]{20}$/.test(sb.project_ref)) return null
@@ -71,8 +69,7 @@ export function parsePreview(raw: unknown): PreviewConfig | null {
   if (!cf || typeof cf.worker !== 'string' || !/^[a-z0-9{}_-]{1,80}$/.test(cf.worker)) return null
 
   const secrets = parseFieldMap(cf.secrets)
-  const sceneEnv = parseFieldMap(cfg.scene_env)
-  if (!secrets || !sceneEnv) return null
+  if (!secrets) return null
 
   return {
     supabase: {
@@ -81,7 +78,6 @@ export function parsePreview(raw: unknown): PreviewConfig | null {
       ...(typeof sb.region === 'string' ? { region: sb.region } : {}),
     },
     cloudflare: { worker: cf.worker, secrets },
-    sceneEnv,
   }
 }
 

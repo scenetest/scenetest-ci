@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { branchPhase, dbUrl, projectUrl } from './supabase.ts'
+import { branchDead, dbUrl, projectUrl } from './supabase.ts'
 
 const branch = (status?: string, project?: string) => ({
   id: 'b1',
@@ -9,29 +9,24 @@ const branch = (status?: string, project?: string) => ({
   ...(project ? { preview_project_status: project } : {}),
 })
 
-describe('branchPhase', () => {
-  it('is building until the branch project is healthy', () => {
-    expect(branchPhase(branch('RUNNING_MIGRATIONS', 'COMING_UP'))).toBe('building')
-    expect(branchPhase(branch(undefined, 'COMING_UP'))).toBe('building')
+describe('branchDead', () => {
+  it('is alive while the branch project comes up, restores, or migrates', () => {
+    expect(branchDead(branch('RUNNING_MIGRATIONS', 'COMING_UP'))).toBe(false)
+    expect(branchDead(branch('MIGRATIONS_PASSED', 'ACTIVE_HEALTHY'))).toBe(false)
+    expect(branchDead(branch(undefined, 'RESTORING'))).toBe(false)
   })
 
-  it('is still building when a healthy project has migrations left to run', () => {
-    expect(branchPhase(branch('RUNNING_MIGRATIONS', 'ACTIVE_HEALTHY'))).toBe('building')
+  it('is alive with failed migrations: the keys still work, the schema is the project\'s problem', () => {
+    expect(branchDead(branch('MIGRATIONS_FAILED', 'ACTIVE_HEALTHY'))).toBe(false)
   })
 
-  it('is ready when the project is healthy and its migrations passed', () => {
-    expect(branchPhase(branch('MIGRATIONS_PASSED', 'ACTIVE_HEALTHY'))).toBe('ready')
-    expect(branchPhase(branch('FUNCTIONS_DEPLOYED', 'ACTIVE_HEALTHY'))).toBe('ready')
+  it('is dead when the branch project failed to come up or is gone', () => {
+    expect(branchDead(branch('MIGRATIONS_PASSED', 'INIT_FAILED'))).toBe(true)
+    expect(branchDead(branch(undefined, 'REMOVED'))).toBe(true)
   })
 
-  it('trusts health alone once the migration field goes away', () => {
-    expect(branchPhase(branch(undefined, 'ACTIVE_HEALTHY'))).toBe('ready')
-  })
-
-  it('fails on a failed migration or a failed branch project', () => {
-    expect(branchPhase(branch('MIGRATIONS_FAILED', 'ACTIVE_HEALTHY'))).toBe('failed')
-    expect(branchPhase(branch('FUNCTIONS_FAILED', 'ACTIVE_HEALTHY'))).toBe('failed')
-    expect(branchPhase(branch('MIGRATIONS_PASSED', 'INIT_FAILED'))).toBe('failed')
+  it('is alive when the API reports no project status at all', () => {
+    expect(branchDead(branch())).toBe(false)
   })
 })
 

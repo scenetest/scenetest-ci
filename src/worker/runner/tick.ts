@@ -5,6 +5,7 @@ import { advanceImageBuilds, ensureImage } from './image.ts'
 import { provisionDroplet, reapRunners } from './digitalocean.ts'
 import { prCoordinator } from '../do/pr-coordinator.ts'
 import { previewProvider } from '../preview/reconcile.ts'
+import { previewCoordinator } from '../do/preview-coordinator.ts'
 
 // The scheduled heartbeat (wrangler.toml [triggers]): walk every async chain
 // forward one step. Order matters — builds first (they may unblock boxes),
@@ -50,7 +51,7 @@ async function archiveTerminalRuns(env: Env): Promise<void> {
   }
 }
 
-// A preview environment's poll schedule belongs to its PR object's alarm.
+// A preview environment's poll schedule belongs to its own object's alarm.
 // This is the backstop for an object that lost the alarm (a crash between the
 // storage write and the alarm write, an eviction mid-step): anything still
 // building and untouched for well past a poll interval gets one poke.
@@ -66,7 +67,7 @@ async function advanceStalePreviews(env: Env): Promise<void> {
     .all<{ repo: string; pr_number: number }>()
   for (const row of stale.results ?? []) {
     try {
-      await prCoordinator(env, row.repo, row.pr_number).fetch('https://do/preview-step', {
+      await previewCoordinator(env, row.repo, row.pr_number).fetch('https://do/step', {
         method: 'POST',
       })
     } catch (err) {

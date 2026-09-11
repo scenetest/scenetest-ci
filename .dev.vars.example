@@ -28,8 +28,9 @@ GITHUB_WEBHOOK_SECRET=
 # GITHUB_API_TOKEN=
 
 # Hosted preview environments (docs/preview-environments.md). Unset, a repo
-# declaring a `preview` block fails its runs with that as the reason; "stub"
-# resolves one locally without calling either service.
+# declaring a `preview` block marks the environment failed with that as the
+# reason; "stub" resolves one locally without calling either service. Runs are
+# unaffected either way — a preview environment never touches the box.
 # PREVIEW_PROVIDER=stub
 # SUPABASE_ACCESS_TOKEN=
 # CLOUDFLARE_API_TOKEN=

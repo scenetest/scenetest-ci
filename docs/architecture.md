@@ -330,20 +330,25 @@ differently on different days and the content-addressing would rot.
 
 ### Hosted preview environments
 
-Not every project can be served from the box. When the app under test is
-itself a deployed Worker over a hosted database, the environment a PR needs is
-a preview Worker pointing at a Supabase preview branch — both built by the
-project's own tooling, both slow. A pipeline file can declare that shape, and
-the PR object then holds the PR's scene batches until the branch is healthy,
-its keys have been written to the Worker, and the scenes have a URL to open.
-Stage updates are not held: the box builds while the environment does.
+A project that deploys what it tests has two per-PR environments built by two
+services that never talk to each other: a Supabase preview branch, and a
+Cloudflare preview Worker that has no idea which database it just got. A
+pipeline file can declare that shape, and the cloud then waits for the branch
+to hand out keys and writes them to the Worker as secrets.
 
-The environment is per PR, like the box, and owns no infrastructure of its
-own — it is a reconciler over two other services' state, stepped from the PR
-object's alarm and recorded in a D1 row that holds refs and URLs but not the
-keys it passes through. A failure or a timeout fails the PR's runs with the
-reason, rather than letting scenes run against last week's database. Details
-in docs/preview-environments.md.
+It is a separate feature from the box, deliberately, and they do not interact:
+the PR's scenes build and run exactly as they would without an environment.
+That keeps the box's model — one per PR, staged, content-addressed — free of a
+second thing to wait for, and keeps the environment free to take as long as
+Supabase takes.
+
+Its own Durable Object per PR owns the poll schedule and nothing else; the
+reconciler behind it is a step function over two other services' state,
+recorded in a D1 row of refs and names. What it waits for is the branch's
+keys, not its migrations: keys exist as soon as the branch project does, and
+holding the handover longer would only keep the Worker pointed at the previous
+PR's database. The outcome lands on its own commit-status context, never on
+the run's. Details in docs/preview-environments.md.
 
 ### Auth
 

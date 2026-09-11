@@ -13,6 +13,10 @@ export interface Env {
   // and it fans them out to the home dashboard's WebSocket subscribers. Holds no
   // canonical state — a rebuildable cache over the D1 projections.
   HOME_COORDINATOR: DurableObjectNamespace
+  // One Durable Object per PR with a hosted preview environment: it owns the
+  // poll schedule while the PR's Supabase branch builds. Separate from
+  // PR_COORDINATOR on purpose — a preview environment never reaches the box.
+  PREVIEW_COORDINATOR: DurableObjectNamespace
   // GitHub OAuth (identity)
   GITHUB_OAUTH_CLIENT_ID: string
   GITHUB_OAUTH_CLIENT_SECRET: string

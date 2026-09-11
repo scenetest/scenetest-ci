@@ -39,6 +39,9 @@ bindings = [
   # Singleton above the per-PR coordinators: holds the home view's live tile
   # cache and fans rollups out to home-dashboard WebSocket subscribers.
   { name = "HOME_COORDINATOR", class_name = "HomeCoordinator" },
+  # One per PR with a hosted preview environment: it owns the poll schedule
+  # while the PR's Supabase branch builds (docs/preview-environments.md).
+  { name = "PREVIEW_COORDINATOR", class_name = "PreviewCoordinator" },
 ]
 
 [[migrations]]
@@ -48,6 +51,10 @@ new_sqlite_classes = ["PrCoordinator"]
 [[migrations]]
 tag = "v2"
 new_sqlite_classes = ["HomeCoordinator"]
+
+[[migrations]]
+tag = "v3"
+new_sqlite_classes = ["PreviewCoordinator"]
 
 [[d1_databases]]
 binding = "DB"
@@ -92,9 +99,10 @@ RUNNER_PROVIDER = "stub"
 # once allowed_user is non-empty).
 BOOTSTRAP_ALLOWED_LOGIN = "mhsnook"
 # Hosted preview environments (docs/preview-environments.md): a PR whose
-# pipeline file declares a `preview` block waits for a Supabase preview branch,
-# then writes its keys to the project's Cloudflare preview Worker. Unset, a
-# declared preview fails the run with that reason.
+# pipeline file declares a `preview` block gets a Supabase preview branch, and
+# that branch's keys written to the project's Cloudflare preview Worker. It
+# runs beside the PR's runs and never touches the box. Unset, a declared
+# preview is marked failed with that reason.
 # PREVIEW_PROVIDER = "supabase-cloudflare"
 # CLOUDFLARE_ACCOUNT_ID = "dd3bee1c1159eb67e1a2249f83e2b4c4"
 # PREVIEW_TIMEOUT_MINUTES = "20"
@@ -127,6 +135,7 @@ custom_domain = true
 bindings = [
   { name = "PR_COORDINATOR", class_name = "PrCoordinator" },
   { name = "HOME_COORDINATOR", class_name = "HomeCoordinator" },
+  { name = "PREVIEW_COORDINATOR", class_name = "PreviewCoordinator" },
 ]
 
 [[env.production.d1_databases]]

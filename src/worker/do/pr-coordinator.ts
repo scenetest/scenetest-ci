@@ -2,8 +2,6 @@ import type { Env } from '../env.ts'
 import type { RunEvent } from '../db.ts'
 import type { HomeTile } from './home-coordinator.ts'
 import { artifactKey, readArtifactLog } from '../artifacts.ts'
-import { stepPreview, type PreviewStatus } from '../preview/reconcile.ts'
-import { postCommitStatus } from '../github.ts'
 
 // One Durable Object per PR: the coordination point between the PR's box and
 // the rest of the system. It terminates the box's single outbound WebSocket
@@ -35,9 +33,7 @@ import { postCommitStatus } from '../github.ts'
 //       (envelope-grade checks only, so newer event types relay through).
 //   cloud → box: { kind: 'command', runId?, command } (a protocol Command;
 //                  runId present only when the command targets a run)
-//                { kind: 'dispatch', run, env? }        (a RunSpec batch; env
-//                  is the PR's preview environment, merged into the scenes
-//                  command's environment on the box)
+//                { kind: 'dispatch', run }              (a RunSpec batch)
 //                { kind: 'update', update }             (checkout + run
 //                  pipeline stages: { headSha, vector, stages: [{name,run}] })
 //
@@ -67,11 +63,6 @@ import { postCommitStatus } from '../github.ts'
 //   POST /dispatch                         — { run: RunSpec } → send or queue
 //   POST /retire                           — { boxId } → close sockets, drop queue
 //   POST /idle-check                       — run the idle-alarm logic now (test hook)
-//   POST /preview-start                    — { repo, prNumber, deadline } → hold
-//                                            dispatches until the PR's preview
-//                                            environment is ready
-//   POST /preview-step                     — poll it now (test hook)
-//   GET  /preview                          — the gate's current state
 //   POST /ingest/:runId                    — { events } → ingestAndFanout
 
 interface EventsEnvelope {
@@ -95,46 +86,6 @@ const REPLAY_PAGE = 1000
 // alarm knows what to retire (the DO can't read its own name).
 const BOX_ID_KEY = 'boxId'
 const IDLE_DEFAULT_MINUTES = 5
-
-// The PR's hosted preview environment, when it has one
-// (docs/preview-environments.md). Two things live here: the gate — while the
-// environment is building, the PR's dispatches wait in the queue instead of
-// going to a box that has nothing to point Playwright at — and the resolved
-// variables, which ride every dispatch from then on.
-const PREVIEW_KEY = 'preview'
-// The idle deadline is stored, not just set as an alarm, because the preview
-// poll shares the object's single alarm: whichever is due first sets it, and
-// alarm() runs whatever is actually due.
-const IDLE_DEADLINE_KEY = 'idleDeadline'
-const PREVIEW_POLL_DEFAULT_SECONDS = 20
-
-interface PreviewGate {
-  // The DO can't read its own name, and the reconciler works in D1 rows keyed
-  // by PR, so the identity is handed in at /preview-start.
-  repo: string
-  prNumber: number
-  status: PreviewStatus
-  env?: Record<string, string>
-  error?: string
-  pollAt?: number
-  deadline: number
-}
-
-// Anything the object sends the box, and so anything it can hold in the queue.
-interface QueuedMessage {
-  kind: 'command' | 'dispatch' | 'update'
-  [key: string]: unknown
-}
-
-// The wire frame for one message to the box. A dispatch carries the preview
-// environment's variables when the PR has one; the box merges them into the
-// scenes command's environment.
-function frame(message: QueuedMessage, gate: PreviewGate | undefined): string {
-  if (message.kind === 'dispatch' && gate?.env) {
-    return JSON.stringify({ ...message, env: gate.env })
-  }
-  return JSON.stringify(message)
-}
 
 // The run/scene boundary events the D1 projections are derived from. Everything
 // else in the log (actions, assertions, …) is a fact for the live stream only —
@@ -319,36 +270,6 @@ export class PrCoordinator implements DurableObject {
       return Response.json({ delivered })
     }
 
-    if (url.pathname === '/preview-start' && req.method === 'POST') {
-      const { repo, prNumber, deadline } = (await req.json()) as {
-        repo: string
-        prNumber: number
-        deadline: number
-      }
-      await this.state.storage.put<PreviewGate>(PREVIEW_KEY, {
-        repo,
-        prNumber,
-        status: 'building',
-        deadline,
-        pollAt: Date.now(),
-      })
-      // The first poll runs on the alarm, not here: this call is on the
-      // webhook's path, and a step can make half a dozen API calls before it
-      // answers. An alarm set to now fires immediately after this returns.
-      await this.armAlarm()
-      return Response.json({ status: 'building' })
-    }
-
-    if (url.pathname === '/preview-step' && req.method === 'POST') {
-      // The poll the alarm makes, on demand — the e2e drives the same path.
-      return Response.json(await this.previewStep())
-    }
-
-    if (url.pathname === '/preview' && req.method === 'GET') {
-      const gate = await this.state.storage.get<PreviewGate>(PREVIEW_KEY)
-      return Response.json(gate ?? null)
-    }
-
     if (url.pathname === '/retire' && req.method === 'POST') {
       const { boxId } = (await req.json()) as { boxId: string }
       await this.retireBoxLocally(boxId)
@@ -358,8 +279,7 @@ export class PrCoordinator implements DurableObject {
     if (url.pathname === '/idle-check' && req.method === 'POST') {
       // Run the idle-alarm logic on demand. The runtime calls alarm() on the
       // timer; this lets the e2e drive the same path deterministically.
-      await this.idleCheck()
-      await this.armAlarm()
+      await this.alarm()
       return Response.json({ ok: true })
     }
 
@@ -411,19 +331,7 @@ export class PrCoordinator implements DurableObject {
   // with status 'destroyed' are swept regardless of age). retireBox in box.ts is
   // not reused — it fetches this same object's /retire, and a DO awaiting a
   // subrequest to itself deadlocks; the equivalent runs inline here instead.
-  // The object's one alarm serves two schedules: the idle window and, while a
-  // preview environment is building, the preview poll. Each pass runs whatever
-  // is due and re-arms for the earlier of the two.
   async alarm(): Promise<void> {
-    const now = Date.now()
-    const gate = await this.state.storage.get<PreviewGate>(PREVIEW_KEY)
-    if (gate?.status === 'building' && (gate.pollAt ?? 0) <= now) await this.previewStep()
-    const idleDeadline = await this.state.storage.get<number>(IDLE_DEADLINE_KEY)
-    if (idleDeadline !== undefined && idleDeadline <= now) await this.idleCheck()
-    await this.armAlarm()
-  }
-
-  private async idleCheck(): Promise<void> {
     const boxId = await this.state.storage.get<string>(BOX_ID_KEY)
     if (!boxId) return
     const active = await this.env.DB.prepare(
@@ -443,37 +351,15 @@ export class PrCoordinator implements DurableObject {
     await this.retireBoxLocally(boxId)
   }
 
-  private previewPollMs(): number {
-    const seconds = Number(this.env.PREVIEW_POLL_SECONDS ?? PREVIEW_POLL_DEFAULT_SECONDS)
-    return (Number.isFinite(seconds) && seconds > 0 ? seconds : PREVIEW_POLL_DEFAULT_SECONDS) * 1000
-  }
-
   private idleTimeoutMs(): number {
     const minutes = Number(this.env.RUNNER_IDLE_TIMEOUT_MINUTES ?? IDLE_DEFAULT_MINUTES)
     return (Number.isFinite(minutes) && minutes > 0 ? minutes : IDLE_DEFAULT_MINUTES) * 60_000
   }
 
-  // Push the idle window out from now. Each activity signal extends it.
+  // Push the idle alarm out by one window. setAlarm replaces any pending one, so
+  // each activity signal extends the window from now.
   private async resetIdleAlarm(): Promise<void> {
-    await this.state.storage.put(IDLE_DEADLINE_KEY, Date.now() + this.idleTimeoutMs())
-    await this.armAlarm()
-  }
-
-  // One alarm, earliest deadline wins. setAlarm replaces any pending one, so
-  // this is called after anything that moves either deadline.
-  private async armAlarm(): Promise<void> {
-    const [idleDeadline, gate] = await Promise.all([
-      this.state.storage.get<number>(IDLE_DEADLINE_KEY),
-      this.state.storage.get<PreviewGate>(PREVIEW_KEY),
-    ])
-    const deadlines: number[] = []
-    if (idleDeadline !== undefined) deadlines.push(idleDeadline)
-    if (gate?.status === 'building') deadlines.push(gate.pollAt ?? Date.now())
-    if (deadlines.length === 0) {
-      await this.state.storage.deleteAlarm()
-      return
-    }
-    await this.state.storage.setAlarm(Math.min(...deadlines))
+    await this.state.storage.setAlarm(Date.now() + this.idleTimeoutMs())
   }
 
   // Close the box's sockets and drop the command queue — the queue targeted the
@@ -484,10 +370,7 @@ export class PrCoordinator implements DurableObject {
     await this.clearQueue()
     if ((await this.state.storage.get<string>(BOX_ID_KEY)) === boxId) {
       await this.state.storage.delete(BOX_ID_KEY)
-      // Drop the idle window, not the alarm: a preview may still be building
-      // for the next box this PR provisions.
-      await this.state.storage.delete(IDLE_DEADLINE_KEY)
-      await this.armAlarm()
+      await this.state.storage.deleteAlarm()
     }
   }
 
@@ -838,121 +721,27 @@ export class PrCoordinator implements DurableObject {
     return this.state.getWebSockets('box')[0] ?? null
   }
 
-  private async sendOrQueue(message: QueuedMessage): Promise<boolean> {
+  private async sendOrQueue(message: object): Promise<boolean> {
     // Dispatching a command/run/update is activity too.
     await this.resetIdleAlarm()
-    const gate = await this.state.storage.get<PreviewGate>(PREVIEW_KEY)
     const box = this.boxSocket()
-    // A batch dispatched while the PR's preview environment is still building
-    // has nothing to run against, so it waits in the queue with everything
-    // else. Stage updates still go through: the box builds while the
-    // environment does.
-    if (box && !(message.kind === 'dispatch' && gate?.status === 'building')) {
-      box.send(frame(message, gate))
+    if (box) {
+      box.send(JSON.stringify(message))
       return true
     }
-    await this.queueMessage(message)
-    return false
-  }
-
-  // Keyed by time + entropy so flush order is FIFO-ish and keys never clash.
-  private async queueMessage(message: QueuedMessage): Promise<void> {
+    // Keyed by time + entropy so flush order is FIFO-ish and keys never clash.
     await this.state.storage.put(
       `${QUEUE_PREFIX}${Date.now().toString().padStart(15, '0')}:${crypto.randomUUID().slice(0, 8)}`,
       message,
     )
+    return false
   }
 
   private async flushQueue(ws: WebSocket): Promise<void> {
-    const gate = await this.state.storage.get<PreviewGate>(PREVIEW_KEY)
-    const held = gate?.status === 'building'
-    const queued = await this.state.storage.list<QueuedMessage>({ prefix: QUEUE_PREFIX })
+    const queued = await this.state.storage.list({ prefix: QUEUE_PREFIX })
     for (const [key, message] of queued) {
-      if (held && message.kind === 'dispatch') continue
-      ws.send(frame(message, gate))
+      ws.send(JSON.stringify(message))
       await this.state.storage.delete(key)
-    }
-  }
-
-  // One poll of this PR's preview environment, and what its answer means for
-  // the PR's work: ready releases the held dispatches with the environment's
-  // variables attached, failed fails them with the reason the reconciler
-  // stopped on, and building schedules the next poll.
-  private async previewStep(): Promise<PreviewGate | null> {
-    const gate = await this.state.storage.get<PreviewGate>(PREVIEW_KEY)
-    if (!gate || gate.status !== 'building') return gate ?? null
-
-    const state = await stepPreview(this.env, gate.repo, gate.prNumber).catch((err) => {
-      console.error(`preview step(${gate.repo}#${gate.prNumber}) failed: ${err instanceof Error ? err.message : err}`)
-      return null
-    })
-
-    // No row: the PR closed while this was building. Nothing left to wait for.
-    if (!state) {
-      await this.state.storage.delete(PREVIEW_KEY)
-      await this.releaseHeld()
-      return null
-    }
-
-    const next: PreviewGate = { ...gate, status: state.status }
-    if (state.error) next.error = state.error
-    else delete next.error
-    if (state.status === 'building') next.pollAt = Date.now() + this.previewPollMs()
-    else delete next.pollAt
-    if (state.status === 'ready') next.env = state.env
-
-    await this.state.storage.put(PREVIEW_KEY, next)
-    if (state.status === 'ready') await this.releaseHeld()
-    if (state.status === 'failed') await this.failHeldRuns(gate, state.error ?? 'preview environment failed')
-    await this.armAlarm()
-    return next
-  }
-
-  private async releaseHeld(): Promise<void> {
-    const box = this.boxSocket()
-    if (box) await this.flushQueue(box)
-  }
-
-  // The environment will never be ready, so the batches waiting on it will
-  // never run. Fail them with the reason rather than leaving the PR queued
-  // until the idle alarm quietly retires its box.
-  private async failHeldRuns(gate: PreviewGate, error: string): Promise<void> {
-    const queued = await this.state.storage.list<QueuedMessage>({ prefix: QUEUE_PREFIX })
-    for (const [key, message] of queued) {
-      if (message.kind === 'dispatch') await this.state.storage.delete(key)
-    }
-
-    const unsettled = await this.env.DB.prepare(
-      `SELECT id, head_sha FROM runs
-         WHERE repo = ?1 AND pr_number = ?2 AND ended_at IS NULL`,
-    )
-      .bind(gate.repo, gate.prNumber)
-      .all<{ id: string; head_sha: string }>()
-    const rows = unsettled.results ?? []
-    if (rows.length === 0) return
-
-    const now = Date.now()
-    await this.env.DB.batch(
-      rows.map((r) =>
-        this.env.DB.prepare(
-          `UPDATE runs SET status = 'failed', ended_at = ?1 WHERE id = ?2 AND ended_at IS NULL`,
-        ).bind(now, r.id),
-      ),
-    )
-
-    const description = `Preview environment failed: ${error}`.slice(0, 140)
-    for (const sha of new Set(rows.map((r) => r.head_sha))) {
-      await postCommitStatus(this.env, {
-        repo: gate.repo,
-        sha,
-        status: 'failed',
-        description,
-        ...(this.env.PUBLIC_BASE_URL
-          ? { targetUrl: `${this.env.PUBLIC_BASE_URL}/repo/${gate.repo}/pr/${gate.prNumber}` }
-          : {}),
-      }).catch((err) =>
-        console.error(`preview status(${gate.repo}#${gate.prNumber}) failed: ${err instanceof Error ? err.message : err}`),
-      )
     }
   }
 

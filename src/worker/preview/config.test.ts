@@ -9,7 +9,6 @@ const valid = {
     worker: 'sunlo-pr-{pr}',
     secrets: { SUPABASE_URL: 'url', SUPABASE_SERVICE_ROLE_KEY: 'service_role_key' },
   },
-  scene_env: { BASE_URL: 'preview_url' },
 }
 
 describe('parsePreview', () => {
@@ -20,19 +19,17 @@ describe('parsePreview', () => {
         worker: 'sunlo-pr-{pr}',
         secrets: { SUPABASE_URL: 'url', SUPABASE_SERVICE_ROLE_KEY: 'service_role_key' },
       },
-      sceneEnv: { BASE_URL: 'preview_url' },
     })
   })
 
-  it('defaults with_data off and both maps empty', () => {
+  it('defaults with_data off and the secret map empty', () => {
     const cfg = parsePreview({ supabase: { project_ref: REF }, cloudflare: { worker: 'w' } })
     expect(cfg?.supabase.withData).toBe(false)
     expect(cfg?.cloudflare.secrets).toEqual({})
-    expect(cfg?.sceneEnv).toEqual({})
   })
 
   it('rejects a block naming a field the environment does not have', () => {
-    expect(parsePreview({ ...valid, scene_env: { BASE_URL: 'jwt_secret' } })).toBeNull()
+    expect(parsePreview({ ...valid, cloudflare: { worker: 'w', secrets: { KEY: 'jwt_secret' } } })).toBeNull()
   })
 
   it('rejects a project ref that is not a project ref', () => {
@@ -40,7 +37,7 @@ describe('parsePreview', () => {
   })
 
   it('rejects an environment variable name a shell would not accept', () => {
-    expect(parsePreview({ ...valid, scene_env: { 'BASE-URL': 'preview_url' } })).toBeNull()
+    expect(parsePreview({ ...valid, cloudflare: { worker: 'w', secrets: { 'BASE-URL': 'url' } } })).toBeNull()
   })
 
   it('rejects a missing half', () => {
@@ -61,7 +58,7 @@ describe('renderWorkerName', () => {
 })
 
 describe('renderFieldMap', () => {
-  it('maps env var names onto environment fields', () => {
+  it('maps secret names onto environment fields', () => {
     const values = {
       url: 'https://x.supabase.co',
       anon_key: 'anon',

@@ -12,10 +12,9 @@
 //      the realized vector via /ready (failure retires the box). The update
 //      also carries the pipeline's scenes command.
 //   3. On {kind:'dispatch'}: run the scenes command with the batch's env
-//      (incl. SCENETEST_REPORT_URL → the local ingest, and the dispatch's own
-//      `env` when the PR has a hosted preview environment). The scenes CLI
-//      POSTs its event batches there; a run:end event settles the verdict, and
-//      a non-zero exit is the failed backstop.
+//      (incl. SCENETEST_REPORT_URL → the local ingest). The scenes CLI POSTs
+//      its event batches there; a run:end event settles the verdict, and a
+//      non-zero exit is the failed backstop.
 //   4. Relay events: the local HTTP ingest on 127.0.0.1:4999 accepts the
 //      scenes CLI's report body (POST /events/:runId, the same
 //      {events:[{seq,payload}]} shape as the cloud ingest); envelopes go up
@@ -201,21 +200,16 @@ async function completeRun(runId, status) {
 // to SCENETEST_REPORT_URL (@scenetest/scenes >=0.15 --report-url), which
 // points at this agent's local ingest; a run:end event settles the
 // verdict, so the command never has to call /complete itself.
-function runBatch(run, repoDir, extraEnv) {
+function runBatch(run, repoDir) {
   const command = currentScenes ?? 'bash scenetest/box-run.sh'
   log(`running batch ${run.runId} (subset: ${run.subset ? run.subset.length : 'all'}): ${command}`)
   const localIngest = `http://127.0.0.1:${LOCAL_PORT}`
-  const names = Object.keys(extraEnv ?? {})
-  if (names.length) log(`batch env from the preview environment: ${names.join(', ')}`)
 
   const child = spawn('bash', ['-c', command], {
     cwd: repoDir ?? WORK_DIR,
     stdio: 'inherit',
     env: {
       ...process.env,
-      // The PR's preview environment, when it has one. Listed before the
-      // SCENETEST_* keys so a project can never rename its way over them.
-      ...(extraEnv ?? {}),
       SCENETEST_RUN_ID: run.runId,
       // Carries dispatch intent (run all / a subset of scene ids). The CLI
       // has no --subset flag; a scenes command that wants subsetting expands
@@ -263,7 +257,7 @@ function connectChannel(repoDir, attempt = 0) {
     } catch {
       return
     }
-    if (msg.kind === 'dispatch' && msg.run?.runId) runBatch(msg.run, repoDir, msg.env)
+    if (msg.kind === 'dispatch' && msg.run?.runId) runBatch(msg.run, repoDir)
     else if (msg.kind === 'update') void applyUpdate(msg.update, repoDir)
     else if (msg.kind === 'command' && msg.runId) {
       appendFileSync(

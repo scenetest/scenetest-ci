@@ -1,29 +1,33 @@
 # Preview environments
 
-Some projects can't be tested from a server on the box. The app under test is
-a Cloudflare Worker, its database is a hosted Supabase project, and a PR's
-real environment is a preview Worker talking to a Supabase preview branch.
-Both are built by the project's own tooling — Supabase branching on the git
-branch, Workers Builds on the push — and both take minutes.
+Some projects deploy the thing they test. The app is a Cloudflare Worker, its
+database is a hosted Supabase project, and a PR's environment is a preview
+Worker talking to a Supabase preview branch. Supabase branching builds the
+branch on a push to the git branch; Workers Builds deploys the Worker. Neither
+one tells the other anything, so the preview Worker has no idea which database
+it just got.
 
-Scenetest Cloud's job is the seam between them: wait for the preview branch to
-finish building, write its keys to the preview Worker, and hold the PR's scene
-batches until that has happened. Without the wait, the scenes run against a
-Worker still pointing at the last PR's database, or at nothing.
+Scenetest Cloud closes that gap and nothing else: wait until the PR's preview
+branch will hand out its keys, then write them to the PR's preview Worker.
+
+**This does not touch the box.** A PR's scenes build and run exactly as they
+would without a preview environment — no waiting, no variables passed, no
+coupling in either direction. The two are separate features that happen to
+share a PR.
 
 ## What a PR gets
 
-One preview environment per PR, keyed by the PR the same way its box is:
-
 - **A Supabase preview branch**, matched to the PR's own git branch. Created
   on the first push if the project has none for that branch, reused after.
-- **The project's Cloudflare preview Worker**, whose secrets are rewritten
-  with the branch's URL and keys once the branch is healthy.
-- **The scenes command's environment**, so Playwright knows which URL to open.
+- **Its keys written to the project's Cloudflare preview Worker**, as Worker
+  secrets, under whatever names the project wants them.
+- **A commit status** on its own `scenetest/preview` context, so an
+  environment that failed to build says so on the PR without ever being
+  confused for a verdict about the code.
 
-The environment outlives a run and follows the PR. A push re-opens it: the
-branch re-runs its migrations, the Worker redeploys, and the values are read
-and written again.
+The environment follows the PR, and a push re-opens it: the branch re-runs its
+migrations, the project redeploys its Worker, and a redeployed Worker is one
+whose secrets are worth writing again.
 
 ## Declaring one
 
@@ -38,13 +42,9 @@ In `scenetest/pipeline.json`, beside `stages` and `scenes`:
       "worker": "sunlo-pr-{pr}",
       "secrets": {
         "SUPABASE_URL": "url",
+        "SUPABASE_ANON_KEY": "anon_key",
         "SUPABASE_SERVICE_ROLE_KEY": "service_role_key"
       }
-    },
-    "scene_env": {
-      "BASE_URL": "preview_url",
-      "VITE_SUPABASE_URL": "url",
-      "VITE_SUPABASE_ANON_KEY": "anon_key"
     }
   },
   "stages": [
@@ -59,12 +59,9 @@ In `scenetest/pipeline.json`, beside `stages` and `scenes`:
 - `supabase.region` — optional; the branch follows the parent's region without it.
 - `cloudflare.worker` — the preview Worker's script name. `{pr}` is the PR
   number and `{branch}` the git branch flattened to lowercase and dashes.
-- `cloudflare.secrets` — environment variable name → field, written to that
-  Worker as secrets.
-- `scene_env` — environment variable name → field, handed to the scenes
-  command on the box.
+- `cloudflare.secrets` — secret name → field, written to that Worker.
 
-The fields either map can name:
+The fields a secret can name:
 
 | Field | What it is |
 | --- | --- |
@@ -73,28 +70,40 @@ The fields either map can name:
 | `service_role_key` | The branch's service role (secret) key |
 | `db_url` | Session-mode connection string; empty if the API withholds the credentials |
 | `branch_ref` | The branch's own project ref |
-| `preview_url` | The preview Worker's `workers.dev` URL |
+| `preview_url` | The Worker's `workers.dev` URL (fetched only if a secret asks for it) |
 | `pr` | The PR number |
 | `branch` | The PR's git branch |
 
 The `preview` block rides the pipeline file, so editing it rebuilds the box
-like any other pipeline change.
+like any other pipeline change — the one incidental tie between the two, and
+only because they share a file.
 
-## What happens on a push
+## What it waits for
 
-1. The webhook creates the run and the box as usual, and opens the preview
-   environment for the PR's head commit.
-2. The PR's Durable Object holds the batch. Stage updates still go to the box:
-   it builds while the environment does.
-3. Every `PREVIEW_POLL_SECONDS` (default 20) the object asks the reconciler for
-   one step. A step reads the branch, and — once the branch is healthy, its
-   migrations have passed, and the preview Worker exists — reads the keys,
-   writes them to the Worker, and resolves the scene variables.
-4. Ready: the held batches go to the box with `scene_env` merged into the
-   scenes command's environment.
-5. Failed, or still building at `PREVIEW_TIMEOUT_MINUTES` (default 20): the
-   PR's unfinished runs fail with the reason, and the commit status says
-   "Preview environment failed: …".
+The branch's **keys**, not its schema. A branch project's keys exist as soon
+as the project does, and migrations don't change them, so there is nothing to
+gain by holding the handover until the migrations pass — the Worker would
+spend those minutes pointed at the *previous* PR's database instead of at its
+own.
+
+The consequence, stated plainly: for a minute or two the preview Worker talks
+to a branch whose migrations are still running, and the app sees tables that
+don't exist yet. That is a better failure than silently reading the wrong
+database, and with the box decoupled nothing is asserting against it.
+
+A step therefore goes: find or create the branch → ask it for keys, and come
+back later if it has none yet → check the preview Worker exists (the project
+deploys it, this never does) → write the secrets → done. Only a branch project
+that failed to come up or is gone (`INIT_FAILED`, `REMOVED`, …) fails the
+environment outright; failed *migrations* do not, because the keys still work.
+
+## The schedule
+
+One Durable Object per PR with a preview environment, and it owns exactly one
+thing: the clock. It polls every `PREVIEW_POLL_SECONDS` (default 20) and stops
+as soon as the environment settles. `PREVIEW_TIMEOUT_MINUTES` (default 20) is
+the give-up point, and the cron sweep re-pokes anything that has been building
+and untouched for five minutes, in case an object lost its alarm.
 
 A closed PR deletes its Supabase branch. The Worker is left alone: the
 project's own deploy created it, so the project's own deploy retires it.
@@ -115,29 +124,28 @@ PREVIEW_PROVIDER = "supabase-cloudflare"
 CLOUDFLARE_ACCOUNT_ID = "…"                 # the account the preview Workers live in
 ```
 
-With `PREVIEW_PROVIDER` unset, a repo that declares a preview fails its runs
-with that as the reason — a declared environment is never skipped silently.
+With `PREVIEW_PROVIDER` unset, a repo that declares a preview marks the
+environment failed with that as the reason — a declared environment is never
+skipped silently.
 
 For the project itself: turn on Supabase branching (the GitHub integration
 that creates a preview branch per git branch), and deploy the preview Worker
 from the PR — Workers Builds, or a `wrangler deploy --name` step in the
-project's own CI. Scenetest Cloud waits for that Worker; it never creates one.
+project's own CI.
 
 ## Where the keys go
 
-The reconciler reads the branch's keys, writes them to the Worker, and drops
-them. D1 keeps the branch ref, the Worker name, the preview URL — and the
-`scene_env` values, because every later run on the PR needs them again. So a
-key named in `cloudflare.secrets` only passes through memory; a key named in
-`scene_env` is stored for the life of the PR and travels to the box with each
-dispatch. Name in `scene_env` only what the scenes actually need.
+Nowhere but the Worker. The reconciler reads them, writes them, and drops
+them. D1 keeps the branch ref, the Worker name, and the preview URL — enough
+to find the same two things on the next push, and nothing that unlocks
+anything.
 
 ## Dev and e2e
 
 `PREVIEW_PROVIDER=stub` resolves a declared environment without calling
-Supabase or Cloudflare: building on the first poll, ready on the second, with
-values that name themselves. The debug routes (`ENABLE_DEBUG_ROUTES=1`) drive
-it: `POST /api/debug/preview-start` opens one for a PR, `POST
-/api/debug/preview-step` runs a poll now instead of waiting for the alarm, and
-`GET /api/debug/preview?repo=…&prNumber=…` shows both the reconciler's row and
-the PR object's gate. `pnpm e2e` uses all three.
+Supabase or Cloudflare: no keys on the first poll, ready on the second. The
+debug routes (`ENABLE_DEBUG_ROUTES=1`) drive it: `POST
+/api/debug/preview-start` opens one for a PR, `POST /api/debug/preview-step`
+runs a poll now instead of waiting for the alarm, and `GET
+/api/debug/preview?repo=…&prNumber=…` shows the row and what the object last
+decided. `pnpm e2e` uses all three.

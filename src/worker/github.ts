@@ -32,7 +32,9 @@ const RUN_STATUS_STATE: Record<string, 'pending' | 'success' | 'failure' | 'erro
 // button reflects what the dashboard already knows. Posted twice in a run's
 // life: `pending` at creation (from `createRun`) and the terminal verdict
 // (from `postRunComplete`); both share the `scenetest` context so they update
-// the same check line. Best-effort by contract: callers run it through
+// the same check line. A caller can name a different context to report on
+// something that is not a run — the preview environment posts its own, so its
+// outcome never mixes with a verdict about the code. Best-effort by contract: callers run it through
 // `ctx.waitUntil` and a GitHub hiccup must not fail the request. Needs
 // GITHUB_API_TOKEN with the `repo:status` scope; when the token is absent or
 // under-scoped (or on any API error) we log and skip, exactly like the read
@@ -43,7 +45,14 @@ const RUN_STATUS_STATE: Record<string, 'pending' | 'success' | 'failure' | 'erro
 // GitHub-App-only — to land with the rest of the App story.
 export async function postCommitStatus(
   env: { GITHUB_API_TOKEN?: string },
-  args: { repo: string; sha: string; status: string; description: string; targetUrl?: string },
+  args: {
+    repo: string
+    sha: string
+    status: string
+    description: string
+    targetUrl?: string
+    context?: string
+  },
 ): Promise<void> {
   const tag = `commit-status(${args.repo}@${args.sha.slice(0, 7)})`
   if (!env.GITHUB_API_TOKEN) {
@@ -58,7 +67,7 @@ export async function postCommitStatus(
       headers: { ...ghHeaders(env), 'content-type': 'application/json' },
       body: JSON.stringify({
         state,
-        context: 'scenetest',
+        context: args.context ?? 'scenetest',
         description: args.description.slice(0, 140),
         target_url: args.targetUrl,
       }),
